@@ -208,7 +208,11 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
         }
 
         if (DateTime.UtcNow < this.nextUpdateAttempt)
+        {
+            // The host calls Update continuously, so returning immediately would spin a CPU core.
+            Thread.Sleep(100);
             return;
+        }
 
         try
         {

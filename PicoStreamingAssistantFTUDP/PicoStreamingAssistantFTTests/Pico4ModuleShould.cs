@@ -5,6 +5,7 @@ using Pico4SAFTExtTrackingModule.BlendshapeScaler;
 using Pico4SAFTExtTrackingModule.PicoConnectors;
 using VRCFaceTracking.Core.Library;
 using VRCFaceTracking.Core.Params.Expressions;
+using System.Diagnostics;
 
 namespace Pico4SAFTExtTrackingModule;
 
@@ -57,9 +58,12 @@ public class Pico4ModuleShould
         };
 
         uut.Update();
+        var retryWait = Stopwatch.StartNew();
         uut.Update();
+        retryWait.Stop();
 
         connector.Verify(m => m.GetBlendShapes(), Times.Once);
+        Assert.IsTrue(retryWait.ElapsedMilliseconds >= 80, "A failed update must not make the host loop spin.");
     }
 
     private class IPicoConnectorMock : IPicoConnector
