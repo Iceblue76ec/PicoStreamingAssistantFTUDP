@@ -6,12 +6,31 @@ using Pico4SAFTExtTrackingModule.PicoConnectors;
 using VRCFaceTracking.Core.Library;
 using VRCFaceTracking.Core.Params.Expressions;
 using System.Diagnostics;
+using VRCFaceTracking;
 
 namespace Pico4SAFTExtTrackingModule;
 
 [TestClass]
 public class Pico4ModuleShould
 {
+    [TestMethod]
+    public void PublishItsIdentityBeforeTheTrackingServiceConnects()
+    {
+        Mock<IPicoConnector> connector = new Mock<IPicoConnector>();
+        Pico4SAFTExtTrackingModule module = new Pico4SAFTExtTrackingModule(connector.Object, GetScalerMock().Object)
+        {
+            Logger = NullLogger.Instance,
+            ModuleInformation = new ModuleMetadata(),
+        };
+
+        var initialized = module.Initialize(true, true);
+
+        Assert.AreEqual((true, true), initialized);
+        Assert.AreEqual("Pico 4 Pro / Enterprise", module.ModuleInformation.Name);
+        Assert.AreEqual(1, module.ModuleInformation.StaticImages.Count);
+        connector.Verify(c => c.Connect(), Times.Never);
+    }
+
     private static Mock<IBlendshapeScaler> GetScalerMock()
     {
         Mock<IBlendshapeScaler> logger = new Mock<IBlendshapeScaler>();

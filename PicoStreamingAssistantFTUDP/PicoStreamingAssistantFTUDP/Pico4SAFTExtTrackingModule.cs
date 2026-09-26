@@ -69,19 +69,9 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
             return (false, false);
         }
 
-        if (StreamerValidity())
-        {
-            Logger.LogInformation("Initializing {} data stream.", this.connector!.GetProcessName());
-            if (!this.connector.Connect())
-            {
-                this.connector.Teardown();
-                this.connector = null;
-            }
-        }
-        else
-            Logger.LogInformation("PICO service is not running yet; it will be detected in the background.");
+        Logger.LogInformation("PICO module loaded; the tracking service will be detected in the background.");
 
-        this.scaler = new FileBlendshapeScalerFactory().build(Logger);
+        this.scaler ??= new FileBlendshapeScalerFactory().build(Logger);
 
         if (FILE_LOG)
         {
@@ -266,6 +256,15 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
         }
         catch (Exception ex)
         {
+            try
+            {
+                this.connector?.Teardown();
+            }
+            catch (Exception teardownError)
+            {
+                Logger.LogDebug(teardownError, "Could not close the PICO connector after an update failure.");
+            }
+            this.connector = null;
             var now = DateTime.UtcNow;
             this.nextUpdateAttempt = now.AddSeconds(1);
 
