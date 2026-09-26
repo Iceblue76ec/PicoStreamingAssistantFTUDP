@@ -19,6 +19,7 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
     private bool disposedValue;
     private IPicoConnector? connector;
     private IBlendshapeScaler? scaler;
+    private DateTime nextConnectorAttempt;
     public (bool, bool) trackingState = (false, false);
 
     private const bool FILE_LOG = false;
@@ -48,31 +49,34 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
         this.connector = ConnectorFactory.build(Logger, new ProcessRunningProgramChecker(), new ConfigChecker(Logger));
         if (this.connector == null)
         {
-            Logger.LogError("\"Streaming Assistant\", \"Streaming Assistant\" or \"PICO Connect\" process was not found. Please run the Streaming Assistant or PICO Connect before VRCFaceTracking.");
+            Logger.LogDebug("Streaming Assistant, Business Streaming, or PICO Connect is not running yet.");
             return false;
         }
 
-        Logger.LogInformation("Using {}.", this.connector.GetProcessName());
+        Logger.LogDebug("Using {}.", this.connector.GetProcessName());
         return true;
     }
 
     public override (bool eyeSuccess, bool expressionSuccess) Initialize(bool eyeAvailable, bool expressionAvailable)
     {
         trackingState = (eyeAvailable, expressionAvailable);
-        if (!StreamerValidity() || (!eyeAvailable && !expressionAvailable))
+        if (!eyeAvailable && !expressionAvailable)
         {
             Logger.LogWarning("No data is usable, skipping initialization.");
             return (false, false);
         }
 
-        Logger.LogInformation("Initializing {} data stream.", this.connector.GetProcessName());
-        /*while (!this.disposedValue && !*/this.connector.Connect()/*) Thread.Sleep(4_000)*/;
-
-        if (this.disposedValue)
+        if (StreamerValidity())
         {
-            Logger.LogWarning("Module failed to establish a connection.");
-            return (false, false);
+            Logger.LogInformation("Initializing {} data stream.", this.connector!.GetProcessName());
+            if (!this.connector.Connect())
+            {
+                this.connector.Teardown();
+                this.connector = null;
+            }
         }
+        else
+            Logger.LogInformation("PICO service is not running yet; it will be detected in the background.");
 
         this.scaler = new FileBlendshapeScalerFactory().build(Logger);
 
@@ -202,6 +206,24 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
 
         try
         {
+            if (this.connector == null)
+            {
+                if (DateTime.UtcNow < this.nextConnectorAttempt)
+                {
+                    Thread.Sleep(100);
+                    return;
+                }
+
+                this.nextConnectorAttempt = DateTime.UtcNow.AddSeconds(5);
+                if (!StreamerValidity() || !this.connector!.Connect())
+                {
+                    this.connector?.Teardown();
+                    this.connector = null;
+                    Thread.Sleep(100);
+                    return;
+                }
+            }
+
             unsafe
             {
                 float* pxrShape = this.connector.GetBlendShapes();

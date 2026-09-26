@@ -1,6 +1,5 @@
 ﻿using Microsoft.Extensions.Logging;
 using Pico4SAFTExtTrackingModule.PacketLogger;
-using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using VRCFaceTracking.Core.Params.Data;
@@ -28,7 +27,6 @@ public sealed class LegacyConnector : IPicoConnector
     private UdpClient? udpClient;
     private IPEndPoint? endPoint;
     private PxrFTInfo data;
-    private Thread? tryReinitializeThread;
 
     private string processName;
 
@@ -38,7 +36,6 @@ public sealed class LegacyConnector : IPicoConnector
         this.connecting = false;
         this.socketLock = new object();
 
-        this.tryReinitializeThread = null;
         this.Logger = Logger;
 
         switch (program_using)
@@ -72,68 +69,28 @@ public sealed class LegacyConnector : IPicoConnector
         }
 
         bool result;
-        int retry = 0;
-
-    ReInitialize:
         try
         {
             lock (this.socketLock)
             {
                 udpClient = new UdpClient(PORT_NUMBER);
                 endPoint = new IPEndPoint(IPAddress.Parse(IP_ADDRESS), PORT_NUMBER);
+                udpClient.Client.ReceiveTimeout = 5000;
             }
-            // Since Streaming Assistant is already running,
-            // this module is indeed needed,
-            // so the timeout failure is unnecessary.
-            // udpClient.Client.ReceiveTimeout = 15000; // Initialization timeout.
 
             Logger.LogDebug("Host end-point: {endPoint}", endPoint);
             Logger.LogDebug("Initialization Timeout: {timeout}ms", udpClient.Client.ReceiveTimeout);
-            Logger.LogDebug("Client established: attempting to receive PxrFTInfo.");
+            Logger.LogDebug("Client established; waiting for PxrFTInfo during updates.");
 
-            Logger.LogInformation("Waiting for {} data stream.", this.processName);
-            unsafe
-            {
-                fixed (PxrFTInfo* pData = &data)
-                {
-                    result = ReceivePxrData(pData, reinit: false);
-                }
-            }
-
-            if (result)
-            {
-                Logger.LogInformation("{} handshake success.", this.processName);
-
-                udpClient.Client.ReceiveTimeout = 5000;
-            }
+            // Binding the port is enough to initialize. Face tracking data may
+            // arrive later; Update() will receive it when the service is ready.
+            result = true;
+            Logger.LogInformation("UDP listener ready for {} data.", this.processName);
         }
         catch (SocketException ex) when (ex.ErrorCode is 10048)
         {
-            if (retry >= 3) result = false;
-            else {
-                retry++;
-                // Magic
-                // Close the pico_et_ft_bt_bridge.exe process and reinitialize it.
-                // It will listen to UDP port before pico_et_ft_bt_bridge.exe runs.
-                // Note: exclusively to simplify older versions of the FT bridge,
-                // the bridge now works without any need for process killing.
-                Process proc = new()
-                {
-                    StartInfo = {
-                        FileName = "taskkill.exe",
-                        ArgumentList = {
-                            "/f",
-                            "/t",
-                            "/im",
-                            "pico_et_ft_bt_bridge.exe"
-                        },
-                        CreateNoWindow = true
-                    }
-                };
-                proc.Start();
-                proc.WaitForExit();
-                goto ReInitialize;
-            }
+            Logger.LogDebug("PICO UDP port {port} is in use; connection will be retried. {message}", PORT_NUMBER, ex.Message);
+            result = false;
         }
         catch (Exception e)
         {
@@ -179,14 +136,10 @@ public sealed class LegacyConnector : IPicoConnector
         {
             if (udpClient is not null)
             {
-                udpClient.Client.Blocking = false;
-                udpClient.Client.Shutdown(SocketShutdown.Receive);
                 udpClient.Client.Close();
             }
             udpClient?.Dispose();
         }
-
-        this.tryReinitializeThread?.Join();
 
         lock (this.socketLock)
         {
@@ -195,7 +148,7 @@ public sealed class LegacyConnector : IPicoConnector
         }
     }
 
-    private unsafe bool ReceivePxrData(PxrFTInfo* pData, bool reinit = true)
+    private unsafe bool ReceivePxrData(PxrFTInfo* pData)
     {
         if (this.IsDisposed()) return false;
 
@@ -215,25 +168,9 @@ public sealed class LegacyConnector : IPicoConnector
         }
         catch (SocketException ex) when (ex.ErrorCode is 10060)
         {
-            // socket time out
+            // No face data yet. Keep the UDP socket bound so later packets can
+            // be consumed without restarting the connector.
             Logger.LogDebug("Data was not sent within the timeout. {msg}", ex.Message);
-            if (reinit) {
-                Logger.LogInformation("Data was not sent within the timeout (is headset hibernated?), reinitialize...");
-
-                // try to reinitialize
-                this.Teardown();
-                lock(this.socketLock) {
-                    this.tryReinitializeThread = new Thread(new ThreadStart(() => {
-                        bool connected;
-                        do {
-                            connected = this.Connect();
-                            if (!connected) Thread.Sleep(200); // try again; we have to set a low number because VRCFT won't call `Teardown()` until all the updates are done
-                        } while (!this.IsDisposed() && !connected);
-                    }));
-                    this.tryReinitializeThread.Start();
-                }
-            }
-
             return false; // got byte failed
         }
         catch (SocketException ex) when (ex.ErrorCode is 10004)
