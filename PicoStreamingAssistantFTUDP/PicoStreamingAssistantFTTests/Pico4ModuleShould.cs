@@ -38,6 +38,7 @@ public class Pico4ModuleShould
 
         // assert
         scalerMock.Verify(m => m.EyeExpressionShapeScale(It.IsAny<float>(), It.IsAny<EyeExpressions>()), Times.Exactly(numberOfEyeParamsSet));
+        scalerMock.Verify(m => m.EyeExpressionShapeScale(It.IsAny<float>(), EyeExpressions.EyeYGazeRight), Times.Once);
         scalerMock.Verify(m => m.UnifiedExpressionShapeScale(It.IsAny<float>(), It.IsAny<UnifiedExpressions>()), Times.Exactly(numberOfFaceParamsSet));
     }
 
