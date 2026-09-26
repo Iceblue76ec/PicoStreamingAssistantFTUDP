@@ -1,5 +1,4 @@
 ﻿using Microsoft.Extensions.Logging;
-using System.Diagnostics;
 
 namespace Pico4SAFTExtTrackingModule.PicoConnectors;
 
@@ -8,6 +7,8 @@ namespace Pico4SAFTExtTrackingModule.PicoConnectors;
  **/
 public sealed class PicoConnectConnector : IPicoConnector
 {
+    private static long lastProtocolNoticeTicks;
+    private static readonly long ProtocolNoticeIntervalTicks = TimeSpan.FromMinutes(1).Ticks;
     private ILogger Logger;
 
     public PicoConnectConnector(ILogger Logger)
@@ -17,8 +18,13 @@ public sealed class PicoConnectConnector : IPicoConnector
 
     public bool Connect()
     {
-        Logger.LogInformation("PICO Connect module is still under development.");
-        Logger.LogInformation("You may want to set `mergetype=2` in the PICO Connect config to use the old protocol. For more information check https://docs.vrcft.io/docs/hardware/pico4pe#pico-connect-beta-setup");
+        long now = DateTime.UtcNow.Ticks;
+        long last = Interlocked.Read(ref lastProtocolNoticeTicks);
+        if (now - last >= ProtocolNoticeIntervalTicks &&
+            Interlocked.CompareExchange(ref lastProtocolNoticeTicks, now, last) == last)
+        {
+            Logger.LogWarning("PICO Connect face tracking cannot start with the current protocol or unreadable settings. Open %APPDATA%\\PICO Connect\\settings.json, set lab.faceTrackingTransferProtocol to 2, save the file, then restart PICO Connect and VRCFaceTracking. See https://docs.vrcft.io/docs/hardware/vr/pico/pico4pe");
+        }
         return false;
     }
 
