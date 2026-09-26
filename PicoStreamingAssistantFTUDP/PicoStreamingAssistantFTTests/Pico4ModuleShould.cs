@@ -1,5 +1,6 @@
 ﻿using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Moq;
+using Microsoft.Extensions.Logging.Abstractions;
 using Pico4SAFTExtTrackingModule.BlendshapeScaler;
 using Pico4SAFTExtTrackingModule.PicoConnectors;
 using VRCFaceTracking.Core.Library;
@@ -43,6 +44,23 @@ public class Pico4ModuleShould
     }
 
 
+
+    [TestMethod]
+    public unsafe void BackOffAfterTrackingUpdateThrows()
+    {
+        Mock<IPicoConnector> connector = new Mock<IPicoConnector>();
+        connector.Setup(m => m.GetBlendShapes()).Throws<InvalidOperationException>();
+        Pico4SAFTExtTrackingModule uut = new Pico4SAFTExtTrackingModule(connector.Object, GetScalerMock().Object)
+        {
+            Status = ModuleState.Active,
+            Logger = NullLogger.Instance,
+        };
+
+        uut.Update();
+        uut.Update();
+
+        connector.Verify(m => m.GetBlendShapes(), Times.Once);
+    }
 
     private class IPicoConnectorMock : IPicoConnector
     {
