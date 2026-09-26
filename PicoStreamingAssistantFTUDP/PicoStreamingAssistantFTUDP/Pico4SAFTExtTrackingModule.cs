@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.Sockets;
 
 using Microsoft.Extensions.Logging;
@@ -20,6 +20,9 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
     private IPicoConnector? connector;
     private IBlendshapeScaler? scaler;
     private DateTime nextConnectorAttempt;
+    private DateTime nextUpdateAttempt;
+    private DateTime nextUpdateWarning;
+    private readonly Dictionary<string, int> updateErrorCounts = new();
     public (bool, bool) trackingState = (false, false);
 
     private const bool FILE_LOG = false;
@@ -204,6 +207,9 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
             return;
         }
 
+        if (DateTime.UtcNow < this.nextUpdateAttempt)
+            return;
+
         try
         {
             if (this.connector == null)
@@ -256,7 +262,25 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
         }
         catch (Exception ex)
         {
-            Logger.LogWarning("Unexpected exceptions: {exception}", ex);
+            var now = DateTime.UtcNow;
+            this.nextUpdateAttempt = now.AddSeconds(1);
+
+            // Group by exception type so the summary below says what actually failed,
+            // instead of collapsing every kind of failure into a single counter.
+            string errorType = ex.GetType().Name;
+            this.updateErrorCounts.TryGetValue(errorType, out int count);
+            this.updateErrorCounts[errorType] = count + 1;
+
+            if (now >= this.nextUpdateWarning)
+            {
+                int total = this.updateErrorCounts.Values.Sum();
+                string breakdown = string.Join(", ", this.updateErrorCounts
+                    .OrderByDescending(entry => entry.Value)
+                    .Select(entry => $"{entry.Key} x{entry.Value}"));
+                Logger.LogWarning("PICO tracking update failed {count} times in the last 30s ({breakdown}); last: {exception}", total, breakdown, ex);
+                this.updateErrorCounts.Clear();
+                this.nextUpdateWarning = now.AddSeconds(30);
+            }
         }
     }
 
