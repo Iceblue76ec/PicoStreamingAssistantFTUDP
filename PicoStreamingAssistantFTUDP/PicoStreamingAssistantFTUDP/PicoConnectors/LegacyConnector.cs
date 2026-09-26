@@ -18,8 +18,9 @@ public sealed class LegacyConnector : IPicoConnector
 
     private static readonly unsafe int pxrHeaderSize = sizeof(TrackingDataHeader);
     private readonly int PacketIndex = pxrHeaderSize;
-    private static readonly unsafe int pxrFtInfoSize = sizeof(PxrFTInfo);
-    private static readonly int PacketSize = pxrHeaderSize + pxrFtInfoSize;
+    // Only the timestamp and blendshape weights are consumed by this module.
+    private const int BlendShapePayloadSize = sizeof(long) + Pxr.BLEND_SHAPE_NUMS * sizeof(float);
+    private static readonly int MinimumPacketSize = pxrHeaderSize + BlendShapePayloadSize;
 
     private bool disposedValue, connecting;
     private object socketLock;
@@ -154,15 +155,16 @@ public sealed class LegacyConnector : IPicoConnector
 
         try
         {
-            fixed (byte* ptr = udpClient!.Receive(ref endPoint))
-            {
-                if (ptr == null) return false;
+            byte[] packet = udpClient!.Receive(ref endPoint);
+            if (packet.Length < MinimumPacketSize) return false;
 
+            fixed (byte* ptr = packet)
+            {
                 TrackingDataHeader tdh;
                 Buffer.MemoryCopy(ptr, &tdh, pxrHeaderSize, pxrHeaderSize);
                 if (tdh.tracking_type != 2) return false; // not facetracking packet
 
-                Buffer.MemoryCopy(ptr + PacketIndex, pData, pxrFtInfoSize, pxrFtInfoSize);
+                Buffer.MemoryCopy(ptr + PacketIndex, pData, sizeof(PxrFTInfo), BlendShapePayloadSize);
             }
             return true;
         }
