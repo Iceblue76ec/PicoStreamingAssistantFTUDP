@@ -21,6 +21,7 @@ public sealed class LegacyConnector : IPicoConnector
     // Only the timestamp and blendshape weights are consumed by this module.
     private const int BlendShapePayloadSize = sizeof(long) + Pxr.BLEND_SHAPE_NUMS * sizeof(float);
     private static readonly int MinimumPacketSize = pxrHeaderSize + BlendShapePayloadSize;
+    private const int MaxPacketsPerUpdate = 1024;
 
     private bool disposedValue, connecting;
     private object socketLock;
@@ -155,18 +156,26 @@ public sealed class LegacyConnector : IPicoConnector
 
         try
         {
-            byte[] packet = udpClient!.Receive(ref endPoint);
-            if (packet.Length < MinimumPacketSize) return false;
-
-            fixed (byte* ptr = packet)
+            // Update can run slower than the incoming UDP stream. Drain queued
+            // packets so tracking reflects the newest valid sample, not old data.
+            var received = false;
+            for (var i = 0; i < MaxPacketsPerUpdate; i++)
             {
-                TrackingDataHeader tdh;
-                Buffer.MemoryCopy(ptr, &tdh, pxrHeaderSize, pxrHeaderSize);
-                if (tdh.tracking_type != 2) return false; // not facetracking packet
+                if (i > 0 && udpClient!.Available == 0) break;
+                byte[] packet = udpClient!.Receive(ref endPoint);
+                if (packet.Length < MinimumPacketSize) continue;
 
-                Buffer.MemoryCopy(ptr + PacketIndex, pData, sizeof(PxrFTInfo), BlendShapePayloadSize);
+                fixed (byte* ptr = packet)
+                {
+                    TrackingDataHeader tdh;
+                    Buffer.MemoryCopy(ptr, &tdh, pxrHeaderSize, pxrHeaderSize);
+                    if (tdh.tracking_type != 2) continue;
+
+                    Buffer.MemoryCopy(ptr + PacketIndex, pData, sizeof(PxrFTInfo), BlendShapePayloadSize);
+                    received = true;
+                }
             }
-            return true;
+            return received;
         }
         catch (SocketException ex) when (ex.ErrorCode is 10060)
         {
