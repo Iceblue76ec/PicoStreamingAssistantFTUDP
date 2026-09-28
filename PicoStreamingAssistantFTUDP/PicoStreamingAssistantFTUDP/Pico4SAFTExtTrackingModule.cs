@@ -19,6 +19,8 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
     private bool disposedValue;
     private IPicoConnector? connector;
     private IBlendshapeScaler? scaler;
+    private readonly Func<IPicoConnector?> connectorFactory;
+    private readonly Func<DateTime> utcNow;
     private DateTime nextConnectorAttempt;
     private DateTime nextUpdateAttempt;
     private DateTime nextUpdateWarning;
@@ -31,25 +33,25 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
 
     public override (bool SupportsEye, bool SupportsExpression) Supported { get; } = (true, true);
 
-    public Pico4SAFTExtTrackingModule()
-    {
-        this.connector = null;
-        this.scaler = null;
-        this.logger = null;
-        this.disposedValue = false;
-    }
+    public Pico4SAFTExtTrackingModule() : this(null, null, null, null) { }
 
     public Pico4SAFTExtTrackingModule(IPicoConnector connector, IBlendshapeScaler scaler)
+        : this(connector, scaler, null, null) { }
+
+    internal Pico4SAFTExtTrackingModule(IPicoConnector? connector, IBlendshapeScaler? scaler,
+        Func<IPicoConnector?>? connectorFactory, Func<DateTime>? utcNow)
     {
         this.connector = connector;
         this.scaler = scaler;
+        this.connectorFactory = connectorFactory ?? (() => ConnectorFactory.build(Logger, new ProcessRunningProgramChecker(), new ConfigChecker(Logger)));
+        this.utcNow = utcNow ?? (() => DateTime.UtcNow);
         this.logger = null;
         this.disposedValue = false;
     }
 
     private bool StreamerValidity()
     {
-        this.connector = ConnectorFactory.build(Logger, new ProcessRunningProgramChecker(), new ConfigChecker(Logger));
+        this.connector = this.connectorFactory();
         if (this.connector == null)
         {
             Logger.LogDebug("Streaming Assistant, Business Streaming, or PICO Connect is not running yet.");
@@ -58,6 +60,96 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
 
         Logger.LogDebug("Using {}.", this.connector.GetProcessName());
         return true;
+    }
+
+    private bool TryConnect()
+    {
+        if (this.utcNow() < this.nextConnectorAttempt)
+        {
+            Thread.Sleep(100);
+            return false;
+        }
+
+        Exception? connectionError = null;
+        try
+        {
+            if (StreamerValidity() && this.connector!.Connect())
+            {
+                // A successful bind must not delay recovery from a later receive failure.
+                this.nextConnectorAttempt = default;
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            connectionError = ex;
+        }
+
+        ResetConnector();
+        var now = this.utcNow();
+        this.nextConnectorAttempt = now.AddSeconds(5);
+        if (connectionError != null)
+            LogFailure(connectionError, "connection", now);
+        Thread.Sleep(100);
+        return false;
+    }
+
+    private void ResetConnector()
+    {
+        var previousConnector = this.connector;
+        this.connector = null;
+        try
+        {
+            previousConnector?.Teardown();
+        }
+        catch (Exception teardownError)
+        {
+            Logger.LogDebug(teardownError, "Could not close the PICO connector.");
+        }
+    }
+
+    private unsafe bool TryGetBlendShapes(out float* shapes)
+    {
+        try
+        {
+            shapes = this.connector!.GetBlendShapes();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            // Only transport failures during reception warrant rebuilding the socket.
+            if (ex is SocketException or ObjectDisposedException)
+                ResetConnector();
+            shapes = null;
+            BackOffUpdate(ex, "receive");
+            return false;
+        }
+    }
+
+    private void BackOffUpdate(Exception ex, string stage)
+    {
+        var now = this.utcNow();
+        this.nextUpdateAttempt = now.AddSeconds(1);
+        LogFailure(ex, stage, now);
+    }
+
+    private void LogFailure(Exception ex, string stage, DateTime now)
+    {
+        // Keep the failure stage as well as the exception type in the summary.
+        string errorType = $"{stage}/{ex.GetType().Name}";
+        this.updateErrorCounts.TryGetValue(errorType, out int count);
+        this.updateErrorCounts[errorType] = count + 1;
+
+        if (now >= this.nextUpdateWarning)
+        {
+            int total = this.updateErrorCounts.Values.Sum();
+            string breakdown = string.Join(", ", this.updateErrorCounts
+                .OrderByDescending(entry => entry.Value)
+                .Select(entry => $"{entry.Key} x{entry.Value}"));
+            Logger.LogWarning("PICO tracking update failed {count} times in the last 30s ({breakdown}); last: {exception}", total, breakdown, ex);
+            this.updateErrorCounts.Clear();
+            this.nextUpdateWarning = now.AddSeconds(30);
+        }
     }
 
     public override (bool eyeSuccess, bool expressionSuccess) Initialize(bool eyeAvailable, bool expressionAvailable)
@@ -197,92 +289,50 @@ public sealed class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
             return;
         }
 
-        if (DateTime.UtcNow < this.nextUpdateAttempt)
+        if (this.utcNow() < this.nextUpdateAttempt)
         {
             // The host calls Update continuously, so returning immediately would spin a CPU core.
             Thread.Sleep(100);
             return;
         }
 
-        try
+        if (this.connector == null && !TryConnect())
+            return;
+
+        unsafe
         {
-            if (this.connector == null)
-            {
-                if (DateTime.UtcNow < this.nextConnectorAttempt)
-                {
-                    Thread.Sleep(100);
-                    return;
-                }
+            if (!TryGetBlendShapes(out float* pxrShape) || pxrShape == null)
+                return;
 
-                this.nextConnectorAttempt = DateTime.UtcNow.AddSeconds(5);
-                if (!StreamerValidity() || !this.connector!.Connect())
-                {
-                    this.connector?.Teardown();
-                    this.connector = null;
-                    Thread.Sleep(100);
-                    return;
-                }
-            }
-
-            unsafe
-            {
-                float* pxrShape = this.connector.GetBlendShapes();
-                if (pxrShape != null)
-                {
-                    if (this.logger != null)
-                    {
-                        // legacy; PacketLogger#UpdateValue needs a PxrFTInfo; but we don't want to send that outside from the PicoConnector
-                        PxrFTInfo data = PicoDataLoggerHelper.FillPxrFTInfo(pxrShape);
-                        this.logger.UpdateValue(&data);
-                    }
-
-                    fixed (UnifiedExpressionShape* unifiedShape = UnifiedTracking.Data.Shapes)
-                    {
-                        if (trackingState.Item1)
-                        {
-                            fixed (UnifiedSingleEyeData* pLeft = &UnifiedTracking.Data.Eye.Left)
-                            fixed (UnifiedSingleEyeData* pRight = &UnifiedTracking.Data.Eye.Right)
-                            {
-                                UpdateEye(pxrShape, pLeft, pRight);
-                                UpdateEyeExpression(pxrShape, unifiedShape);
-                            }
-                        }
-
-                        if (trackingState.Item2) 
-                            UpdateExpression(pxrShape, unifiedShape);
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
             try
             {
-                this.connector?.Teardown();
-            }
-            catch (Exception teardownError)
-            {
-                Logger.LogDebug(teardownError, "Could not close the PICO connector after an update failure.");
-            }
-            this.connector = null;
-            var now = DateTime.UtcNow;
-            this.nextUpdateAttempt = now.AddSeconds(1);
+                if (this.logger != null)
+                {
+                    // legacy; PacketLogger#UpdateValue needs a PxrFTInfo; but we don't want to send that outside from the PicoConnector
+                    PxrFTInfo data = PicoDataLoggerHelper.FillPxrFTInfo(pxrShape);
+                    this.logger.UpdateValue(&data);
+                }
 
-            // Group by exception type so the summary below says what actually failed,
-            // instead of collapsing every kind of failure into a single counter.
-            string errorType = ex.GetType().Name;
-            this.updateErrorCounts.TryGetValue(errorType, out int count);
-            this.updateErrorCounts[errorType] = count + 1;
+                fixed (UnifiedExpressionShape* unifiedShape = UnifiedTracking.Data.Shapes)
+                {
+                    if (trackingState.Item1)
+                    {
+                        fixed (UnifiedSingleEyeData* pLeft = &UnifiedTracking.Data.Eye.Left)
+                        fixed (UnifiedSingleEyeData* pRight = &UnifiedTracking.Data.Eye.Right)
+                        {
+                            UpdateEye(pxrShape, pLeft, pRight);
+                            UpdateEyeExpression(pxrShape, unifiedShape);
+                        }
+                    }
 
-            if (now >= this.nextUpdateWarning)
+                    if (trackingState.Item2)
+                        UpdateExpression(pxrShape, unifiedShape);
+                }
+            }
+            catch (Exception ex)
             {
-                int total = this.updateErrorCounts.Values.Sum();
-                string breakdown = string.Join(", ", this.updateErrorCounts
-                    .OrderByDescending(entry => entry.Value)
-                    .Select(entry => $"{entry.Key} x{entry.Value}"));
-                Logger.LogWarning("PICO tracking update failed {count} times in the last 30s ({breakdown}); last: {exception}", total, breakdown, ex);
-                this.updateErrorCounts.Clear();
-                this.nextUpdateWarning = now.AddSeconds(30);
+                // Mapping and optional logging failures do not invalidate the UDP listener.
+                BackOffUpdate(ex, "processing");
             }
         }
     }
