@@ -1,83 +1,140 @@
-# PICO 模块诊断日志
+## English || [简体中文](logging_CN.md)
 
-模块继续同步调用 VRCFT 提供的 `ILogger`，不增加日志消息队列或批量写盘线程。
-首次事件立即输出；短包等收包事件在本轮收包结束时输出，避免在逐包循环中格式化日志。
-这里只保留重复次数，不能保证宿主写入失败或进程终止时尚未输出的计数被保存。
+# PICO module diagnostic logging
 
-每条模块日志包含本地时间、毫秒、时区、消息编号、连接尝试编号和事件名，例如：
+The module continues to call the `ILogger` provided by VRCFT synchronously, and adds
+no log message queue or batch disk-write thread.
+The first occurrence of an event is output immediately; receive-path events such as
+short packets are output when the receive round ends, avoiding formatting logs inside
+the per-packet loop.
+Only the repeat count is kept here, and it cannot be guaranteed that counts not yet
+output are saved when the host write fails or the process terminates.
+
+Every module log contains local time, milliseconds, time zone, message number,
+connection attempt number and event name, for example:
 
 ```text
 2026-09-29 21:03:12.140 +08:00 [PICO #12 connection=2 UpdateFailure/receive] ...
 ```
 
-异常详情作为首次日志的一部分输出，包含 `Exception.ToString()` 的完整信息。
-同一事件的摘要引用首次消息编号，并包含本轮计数起点、首次及最后发生的时间。
-所有时间字段（包括摘要和最后收包时间）统一使用本地时间 `yyyy-MM-dd HH:mm:ss.fff zzz`，
-采用公历和固定数字格式，不随系统显示语言改变。
-多行堆栈属于同一条带时间戳的日志。时间戳使用墙上时钟；生产环境的窗口和持续时间使用单调计时，
-避免系统时间调整影响诊断窗口。连接尝试编号表示本地探测/绑定尝试，不表示头显重新建立串流。
+Exception details are output as part of the first log and contain the complete
+information of `Exception.ToString()`.
+The summary of the same event references the first message number and contains the
+start of the counting round, and the time of the first and last occurrence.
+All time fields (including the summary and the last receive time) uniformly use local
+time `yyyy-MM-dd HH:mm:ss.fff zzz`, using the Gregorian calendar and fixed numeric
+format, and do not change with the system display language.
+A multi-line stack belongs to the same timestamped log. Timestamps use the wall clock;
+windows and durations in the production path use monotonic timing, avoiding system time
+adjustments affecting the diagnostic windows. The connection attempt number means a
+local probe/bind attempt, not the headset re-establishing streaming.
 
-## 分级与事件
+## Levels and events
 
-| 级别 | 事件 |
+| Level | Events |
 | --- | --- |
-| Info | 启动和缩放配置摘要、等待/选中串流程序、协议值、UDP 绑定、首次有效样本、无数据开始、接收/处理恢复、模块暂停和退出 |
-| Warning | 短包、连续没有有效面捕样本、长时间无有效数据、连接/收包异常、配置缺失或不可读、connector 清理失败 |
-| Error | 无效配置 JSON、缩放配置处理失败、眼部/表情处理异常、初始化失败 |
-| Debug | 程序探测结果、配置路径、非面捕类型包、已处理的超时、收包数量/样本覆盖/排队上限统计、预期的接收取消 |
+| Info | Startup and scaling config summary, waiting for/selected streamer, protocol value, UDP bind, first valid sample, start of no data, receive/processing recovery, module pause and exit |
+| Warning | Short packets, consecutive absence of valid face samples, no valid data for a long time, connection/receive exceptions, missing or unreadable config, connector cleanup failure |
+| Error | Invalid config JSON, scaling config processing failure, eye/expression processing exception, initialization failure |
+| Debug | Streamer probe results, config paths, non-face packet types, handled timeouts, receive count/sample coverage/queue limit statistics, expected receive cancellation |
 
-仓库固定的 VRCFT 版本默认在文件中记录 Debug 及以上，输出页显示 Info 及以上。
-模块不修改宿主的过滤规则、文件刷新策略或日志文件轮转策略。
+The VRCFT version pinned by the repository logs Debug and above to the file by default,
+and the output page shows Info and above.
+The module does not modify the host's filtering rules, file flush policy or log file
+rotation policy.
 
-## 去重与计数
+## Deduplication and counting
 
-- 同一事件连续出现时，30 秒内只保留首次详情。周期到期、问题恢复或正常退出时输出额外重复次数。
-- 各事件独立计数；异常按阶段、处理操作、级别、类型、错误码、消息及堆栈首个位置区分。
-  新错误不会被其他错误的窗口压掉。30 秒未再出现后重新发生的事件会重新保留详情。
-- 计数保存在模块中，跨 connector 重建保留；最多保留 128 种签名，超出时先汇总并淘汰最久未出现的签名。
-  恢复时输出剩余计数，但保留去重签名，避免短暂恢复后同一故障再次出现就重新打印完整堆栈。
-- 短包按 `<312` 分类，Debug 统计另外记录数量和长度范围。所有非面捕类型包共用一个
-  `OtherPacketType` 事件和固定签名；`tracking_type`、长度和来源地址都不进入这个事件的签名。
-  首次详情记录本轮数量和首个包的类型、长度、来源，重复包数量按 30 秒窗口汇总。
-  各类型仍在固定 256 槽数组中分别计数；首次详情及周期统计显示当前统计区间内数量最多的 5 类
-  （同数量按类型数值升序），格式为 `otherTypeCounts=[类型:包数, ...]`。
-  `otherTypeOtherPackets` 表示未列出的类型的总包数，不是类型数；统计输出后清空分类计数。
-- 收包统计每 30 秒及 connector 关闭时输出。`supersededValid` 表示同一轮中被更新有效样本覆盖的样本数，
-  不表示网络丢包。达到 1024 包上限且仍有排队数据时记录 `ReceiveLimit`。
-- 宿主日志写入异常不会逃逸到追踪流程；后续成功写入时附带先前写入失败次数。
+- When the same event occurs consecutively, only the first detail is kept within
+  30 seconds. The extra repeat count is output when the period expires, the problem
+  recovers or the module exits normally.
+- Each event is counted independently; exceptions are distinguished by stage, processing
+  operation, level, type, error code, message and the first position of the stack.
+  A new error is not suppressed by the window of other errors. An event that occurs again
+  after 30 seconds without reappearing keeps its detail again.
+- Counts are kept in the module and are preserved across connector rebuilds; at most 128
+  signatures are kept, and when exceeded the longest-absent signature is summarized and
+  evicted first.
+  On recovery the remaining counts are output, but the deduplication signature is kept, so
+  that the same failure does not print the complete stack again just because it reappears
+  after a brief recovery.
+- Short packets are classified by `<312`, and the Debug statistics additionally record the
+  count and the length range. All non-face packet types share one
+  `OtherPacketType` event and a fixed signature; `tracking_type`, length and source
+  address all do not enter the signature of this event.
+  The first detail records the count of this round and the type, length and source of the
+  first packet, and the repeat packet count is aggregated by a 30 second window.
+  Each type is still counted separately in a fixed 256 slot array; the first detail and
+  the periodic statistics show the 5 most numerous types within the current statistics
+  interval (for equal counts, in ascending order of the type value), in the format
+  `otherTypeCounts=[type:packet count, ...]`.
+  `otherTypeOtherPackets` means the total packet count of the types not listed, not the
+  number of types; the classification counts are cleared after the statistics are output.
+- Receive statistics are output every 30 seconds and when a connector closes.
+  `supersededValid` means the number of samples in the same round that were superseded by
+  an updated valid sample, not network packet loss. When the 1024 packet limit is reached
+  and data is still queued, `ReceiveLimit` is recorded.
+- A host log write exception does not escape into the tracking flow; on a subsequent
+  successful write the number of previous write failures is attached.
 
-## 新增日志时的签名约定
+## Signature conventions when adding logs
 
-`diagnostics.Logger` 对结构化日志按级别、事件名、事件 ID、未渲染的 `{OriginalFormat}` 消息模板
-及异常签名去重，模板参数的变化不产生新详情。不同模板或显式 ID 不会因为默认事件名为
-`Diagnostic` 而互相合并。只在需要输出首次详情时调用格式化器。
+`diagnostics.Logger` deduplicates structured logs by level, event name, event ID, the
+unrendered `{OriginalFormat}` message template
+and the exception signature; changes in template parameters do not produce a new detail.
+Different templates or explicit IDs are not merged with each other just because the
+default event name is
+`Diagnostic`. The formatter is called only when the first detail needs to be output.
 
-使用固定模板和占位符，例如 `LogDebug("Count={Count}", count)`；不要先用字符串插值构造模板。
-高频事件和需要立即显示状态变化的事件，应直接使用 `Report(级别, 事件名, 稳定签名, 消息工厂)`。
-签名只包含有界的语义状态，不要使用报文内容、任意路径或持续增长的计数。
-程序探测签名包含三种程序的存在状态；协议签名区分支持的 legacy 与不支持的配置，
-不支持配置的具体协议值仍保留在首次详情中。
+Use fixed templates and placeholders, for example `LogDebug("Count={Count}", count)`; do
+not construct the template with string interpolation first.
+Events of high frequency, and events that need to show a state change immediately, should
+directly use `Report(level, event name, stable signature, message factory)`.
+A signature only contains bounded semantic state; do not use packet content, arbitrary
+paths or continuously growing counts.
+The streamer probe signature contains the presence state of the three streamers; the
+protocol signature distinguishes supported legacy from unsupported configurations, and
+the concrete protocol value of an unsupported configuration is still kept in the first
+detail.
 
-自定义 `ILogger` 状态如果没有 `{OriginalFormat}`，必须为每种事件提供明确的事件名或非零 ID，
-或者改用 `Report`。既没有模板也没有显式事件标识的调用，出于兼容仍按渲染后的文本区分，
-不具备对变化文本的限频保证，不得用于高频日志。签名最多 128 种只限制内存占用，不能代替限频。
+If a custom `ILogger` state has no `{OriginalFormat}`, an explicit event name or non-zero
+ID must be provided for each event,
+or `Report` must be used instead. For calls that have neither a template nor an explicit
+event identity, for compatibility they are still distinguished by the rendered text,
+and carry no rate-limiting guarantee for changing text, so they must not be used for
+high-frequency logs. The maximum of 128 signatures only limits memory usage and cannot
+replace rate limiting.
 
-## 无数据与恢复
+## No data and recovery
 
-分别记录最后收到任意数据报、最后收到有效面捕样本以及处理失败后的恢复。
-这里的“有效”只表示通过现有长度和类型检查，不表示验证了所有字段或浮点数。
+The last receipt of any datagram, the last receipt of a valid face sample and the
+recovery after a processing failure are recorded separately.
+"Valid" here only means passing the existing length and type checks, not that all fields
+or floating point numbers have been verified.
 
-观察到 5 秒没有有效面捕样本后：没有任何数据报时记录 Info `NoPackets`；
-仍收包但不能用于面捕时记录 Warning `NoValidSamples`。
-30 秒没有有效样本时另外记录一次 Warning `NoDataProlonged`。
-无数据期间最多每 30 秒检查一次选中的串流程序，进程存在状态变化时记录 Info。
-这些事件不关闭 socket、不触发错误退避，也不能证明头显休眠或网络丢包。
-来源地址未经认证，不能把收到的短包确定归因于 PICO。
+After observing 5 seconds without a valid face sample: when there is no datagram at all,
+Info `NoPackets` is recorded;
+when packets are still received but cannot be used for face tracking, Warning
+`NoValidSamples` is recorded.
+When there is no valid sample for 30 seconds, a Warning `NoDataProlonged` is additionally
+recorded once.
+During no data, the selected streamer is checked at most once every 30 seconds, and Info
+is recorded when the process presence state changes.
+These events do not close the socket, do not trigger the error backoff, and cannot prove
+that the headset is asleep or that the network dropped packets.
+The source address is not authenticated, and received short packets cannot be
+definitively attributed to PICO.
 
-接收超时仍为 5000ms；状态在接收返回后检查，因此检测时间可能晚于上述阈值。
-模块主动暂停和异常退避期间不观察接收，相关时间从无数据持续时间中排除。
-接收恢复与处理恢复分别记录；处理恢复时长包含实际异常退避时间。
+The receive timeout is still 5000ms; the state is checked after receive returns, so the
+detection time may be later than the above thresholds.
+During deliberate module pause and exception backoff, reception is not observed, and the
+relevant time is excluded from the no-data duration.
+Receive recovery and processing recovery are recorded separately; the processing recovery
+duration includes the actual exception backoff time.
 
-收包阶段逃逸的 `SocketException` / `ObjectDisposedException` 重建本地 UDP listener，
-其他收包异常及处理异常保留 connector；两者均记录 1000ms 更新退避。
-服务探测/连接失败记录 5000ms 连接退避。日志增强不修改这些恢复规则。
+A `SocketException` / `ObjectDisposedException` escaping the receive stage rebuilds the
+local UDP listener,
+while other receive exceptions and processing exceptions keep the connector; both record
+a 1000ms update backoff.
+Service probe/connection failure records a 5000ms connection backoff. The logging
+enhancement does not modify these recovery rules.
