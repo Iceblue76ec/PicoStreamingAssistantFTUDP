@@ -4,6 +4,8 @@ using System.Net;
 using System.Net.Sockets;
 using VRCFaceTracking.Core.Params.Data;
 using VRCFaceTracking;
+using Pico4SAFTExtTrackingModule.Diagnostics;
+using Pico4SAFTExtTrackingModule.PicoConnectors.ProgramChecker;
 
 namespace Pico4SAFTExtTrackingModule.PicoConnectors;
 
@@ -35,6 +37,10 @@ public sealed class LegacyConnector : IPicoConnector
     private UdpClient? udpClient;
     private IPEndPoint? endPoint;
     private PxrFTInfo data;
+    private readonly PicoDiagnostics diagnostics;
+    private readonly PicoPrograms program;
+    private readonly bool ownsDiagnostics;
+    private ReceiveDiagnostics? receiveDiagnostics;
 
     private string processName;
 
@@ -44,7 +50,10 @@ public sealed class LegacyConnector : IPicoConnector
         this.connecting = false;
         this.socketLock = new object();
 
-        this.Logger = Logger;
+        diagnostics = PicoDiagnostics.ForLogger(Logger);
+        ownsDiagnostics = !ReferenceEquals(Logger, diagnostics.Logger);
+        this.Logger = diagnostics.Logger;
+        program = program_using;
 
         switch (program_using)
         {
@@ -62,7 +71,7 @@ public sealed class LegacyConnector : IPicoConnector
 
             default:
                 // shouldn't reach this
-                Logger.LogWarning("Couldn't find the name for program " + program_using.ToString());
+                this.Logger.LogWarning("Couldn't find the name for program {Program}", program_using);
                 this.processName = "[?]";
                 break;
         }
@@ -89,23 +98,24 @@ public sealed class LegacyConnector : IPicoConnector
                 udpClient.Client.ReceiveTimeout = 5000;
             }
 
-            Logger.LogDebug("Host end-point: {endPoint}", endPoint);
-            Logger.LogDebug("Initialization Timeout: {timeout}ms", udpClient.Client.ReceiveTimeout);
-            Logger.LogDebug("Client established; waiting for PxrFTInfo during updates.");
+            receiveDiagnostics = new ReceiveDiagnostics(diagnostics,
+                () => new ProcessRunningProgramChecker().Check(program));
 
             // Binding the port is enough to initialize. Face tracking data may
             // arrive later; Update() will receive it when the service is ready.
             result = true;
-            Logger.LogInformation("UDP listener ready for {} data.", this.processName);
+            Logger.LogInformation("UDP listener bound to {LocalEndpoint} for {Program}; receiveTimeout={Timeout}ms. " +
+                "Waiting for valid face data; sender endpoints are not restricted.",
+                udpClient.Client.LocalEndPoint, processName, udpClient.Client.ReceiveTimeout);
         }
         catch (SocketException ex) when (ex.ErrorCode is 10048)
         {
-            Logger.LogDebug("PICO UDP port {port} is in use; connection will be retried. {message}", PORT_NUMBER, ex.Message);
+            Logger.LogWarning(ex, "PICO UDP port {Port} is in use; connection retry in 5000ms.", PORT_NUMBER);
             result = false;
         }
         catch (Exception e)
         {
-            Logger.LogWarning("{exception}", e);
+            Logger.LogWarning(e, "Could not bind PICO UDP listener on port {Port}; retry in 5000ms.", PORT_NUMBER);
             result = false;
         }
 
@@ -142,7 +152,8 @@ public sealed class LegacyConnector : IPicoConnector
             this.disposedValue = true;
         }
 
-        Logger.LogInformation("Disposing of PxrFaceTracking UDP Client.");
+        receiveDiagnostics?.Statistics(final: true);
+        Logger.LogInformation("Closing local PICO UDP listener for {Program}.", processName);
         lock (this.socketLock)
         {
             if (udpClient is not null)
@@ -157,12 +168,17 @@ public sealed class LegacyConnector : IPicoConnector
             udpClient = null;
             endPoint = null;
         }
+        if (ownsDiagnostics) diagnostics.Flush(forget: true);
     }
 
     private unsafe bool ReceivePxrData(PxrFTInfo* pData)
     {
         if (this.IsDisposed()) return false;
 
+        int validInBatch = 0;
+        int drained = 0;
+        bool limitReached = false;
+        bool receptionCompleted = false;
         try
         {
             // Update can run slower than the incoming UDP stream. Drain queued
@@ -172,36 +188,55 @@ public sealed class LegacyConnector : IPicoConnector
             {
                 if (i > 0 && udpClient!.Available == 0) break;
                 byte[] packet = udpClient!.Receive(ref endPoint);
+                drained++;
+                receiveDiagnostics?.Packet(packet.Length);
                 // Sender endpoints are not checked, so any sender that can reach the bound
                 // port can supply a datagram. This length check bounds the memory copies;
                 // the tracking_type check below does not authenticate the sender or validate
                 // the other header fields, fragmentation flags or floating-point values.
-                if (packet.Length < MinimumPacketSize) continue;
+                if (packet.Length < MinimumPacketSize)
+                {
+                    receiveDiagnostics?.ShortPacket(packet.Length, endPoint);
+                    continue;
+                }
 
                 fixed (byte* ptr = packet)
                 {
                     TrackingDataHeader tdh;
                     Buffer.MemoryCopy(ptr, &tdh, pxrHeaderSize, pxrHeaderSize);
-                    if (tdh.tracking_type != 2) continue;
+                    if (tdh.tracking_type != 2)
+                    {
+                        receiveDiagnostics?.OtherType(tdh.tracking_type, packet.Length, endPoint);
+                        continue;
+                    }
 
                     Buffer.MemoryCopy(ptr + PacketIndex, pData, sizeof(PxrFTInfo), BlendShapePayloadSize);
                     received = true;
+                    validInBatch++;
+                    receiveDiagnostics?.ValidPacket(packet.Length, endPoint);
                 }
             }
+            limitReached = drained == MaxPacketsPerUpdate && udpClient!.Available > 0;
+            receptionCompleted = true;
             return received;
         }
         catch (SocketException ex) when (ex.ErrorCode is 10060)
         {
             // No face data yet. Keep the UDP socket bound so later packets can
             // be consumed without restarting the connector.
-            Logger.LogDebug("Data was not sent within the timeout. {msg}", ex.Message);
+            receiveDiagnostics?.Timeout();
+            receptionCompleted = true;
             return false; // got byte failed
         }
         catch (SocketException ex) when (ex.ErrorCode is 10004)
         {
             // `Teardown()` called
-            Logger.LogInformation("Socket closed");
+            Logger.LogDebug("UDP receive interrupted (10004); local socket is closing.");
             return false; // got byte failed
+        }
+        finally
+        {
+            receiveDiagnostics?.EndBatch(validInBatch, limitReached, observeHealth: receptionCompleted);
         }
     }
 

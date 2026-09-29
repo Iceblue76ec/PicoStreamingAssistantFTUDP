@@ -1,5 +1,7 @@
 ﻿using Microsoft.Extensions.Logging;
 
+using Pico4SAFTExtTrackingModule.Diagnostics;
+
 namespace Pico4SAFTExtTrackingModule.PicoConnectors;
 
 /**
@@ -7,24 +9,21 @@ namespace Pico4SAFTExtTrackingModule.PicoConnectors;
  **/
 public sealed class PicoConnectConnector : IPicoConnector
 {
-    private static long lastProtocolNoticeTicks;
-    private static readonly long ProtocolNoticeIntervalTicks = TimeSpan.FromMinutes(1).Ticks;
-    private ILogger Logger;
+    private readonly PicoDiagnostics diagnostics;
 
     public PicoConnectConnector(ILogger Logger)
     {
-        this.Logger = Logger;
+        diagnostics = PicoDiagnostics.ForLogger(Logger);
     }
 
     public bool Connect()
     {
-        long now = DateTime.UtcNow.Ticks;
-        long last = Interlocked.Read(ref lastProtocolNoticeTicks);
-        if (now - last >= ProtocolNoticeIntervalTicks &&
-            Interlocked.CompareExchange(ref lastProtocolNoticeTicks, now, last) == last)
-        {
-            Logger.LogWarning("PICO Connect face tracking cannot start with the current protocol or unreadable settings. Open %APPDATA%\\PICO Connect\\settings.json, set lab.faceTrackingTransferProtocol to 2, save the file, then restart PICO Connect and VRCFaceTracking. See https://docs.vrcft.io/docs/hardware/vr/pico/pico4pe");
-        }
+        diagnostics.Report(LogLevel.Warning, "UnsupportedProtocol", "", () =>
+            "PICO Connect face tracking cannot start with the current protocol or unreadable settings. " +
+            "Open %APPDATA%\\PICO Connect\\settings.json, set lab.faceTrackingTransferProtocol to 2, save the file, " +
+            "then restart PICO Connect and VRCFaceTracking. Connection retry in 5000ms. " +
+            "See https://docs.vrcft.io/docs/hardware/vr/pico/pico4pe");
+        diagnostics.Tick();
         return false;
     }
 
