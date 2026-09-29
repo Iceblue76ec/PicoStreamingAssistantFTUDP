@@ -18,7 +18,13 @@ public sealed class LegacyConnector : IPicoConnector
 
     private static readonly unsafe int pxrHeaderSize = sizeof(TrackingDataHeader);
     private readonly int PacketIndex = pxrHeaderSize;
-    // Only the timestamp and blendshape weights are consumed by this module.
+    // Minimum accepted length for the legacy layout declared in Pxr.cs:
+    //   16 (header) + 8 (uninterpreted timestamp) + 72 * 4 (weights) = 312 bytes.
+    // Only weights are used. The 596-byte suffix of the full PxrFTInfo is not copied;
+    // this decoder accepts an absent, partial or complete suffix. This acceptance rule
+    // does not establish that PICO defines those fields as optional in its wire protocol.
+    // PICO Connect legacy setup (configuration guidance, not the source of these sizes):
+    // https://docs.vrcft.io/docs/hardware/vr/pico/pico4pe
     private const int BlendShapePayloadSize = sizeof(long) + Pxr.BLEND_SHAPE_NUMS * sizeof(float);
     private static readonly int MinimumPacketSize = pxrHeaderSize + BlendShapePayloadSize;
     private const int MaxPacketsPerUpdate = 1024;
@@ -75,7 +81,10 @@ public sealed class LegacyConnector : IPicoConnector
         {
             lock (this.socketLock)
             {
+                // UdpClient(port) binds all IPv4 interfaces (0.0.0.0:29765).
                 udpClient = new UdpClient(PORT_NUMBER);
+                // Receive(ref endPoint) replaces this value with the actual sender;
+                // initializing it to 127.0.0.1 does not restrict who can send packets.
                 endPoint = new IPEndPoint(IPAddress.Parse(IP_ADDRESS), PORT_NUMBER);
                 udpClient.Client.ReceiveTimeout = 5000;
             }
@@ -163,6 +172,10 @@ public sealed class LegacyConnector : IPicoConnector
             {
                 if (i > 0 && udpClient!.Available == 0) break;
                 byte[] packet = udpClient!.Receive(ref endPoint);
+                // Sender endpoints are not checked, so any sender that can reach the bound
+                // port can supply a datagram. This length check bounds the memory copies;
+                // the tracking_type check below does not authenticate the sender or validate
+                // the other header fields, fragmentation flags or floating-point values.
                 if (packet.Length < MinimumPacketSize) continue;
 
                 fixed (byte* ptr = packet)
