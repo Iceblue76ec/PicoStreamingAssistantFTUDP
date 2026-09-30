@@ -215,7 +215,6 @@ public class Pico4ModuleRecoveryShould
     }
 
 
-
     [TestMethod]
     public void RebuildWhenABackgroundLoopEndsWithANonSocketException()
     {
@@ -231,10 +230,98 @@ public class Pico4ModuleRecoveryShould
         Assert.AreEqual(1, second.Reads);
     }
 
+    [TestMethod]
+    public void SummarizePersistentFailuresByStageWithoutLoggingEveryRetry()
+    {
+        var clock = new RetryClock();
+        using var connector = new RetryConnector();
+        var scaler = PassthroughScaler();
+        scaler.Setup(s => s.EyeExpressionShapeScale(It.IsAny<float>(), It.IsAny<EyeExpressions>()))
+            .Throws(new InvalidOperationException("Mapping failed."));
+        var warnings = new List<string>();
+        var logger = new Mock<ILogger>();
+        logger.Setup(l => l.IsEnabled(It.IsAny<LogLevel>())).Returns(true);
+        logger.Setup(l => l.Log(It.IsAny<LogLevel>(), It.IsAny<EventId>(), It.IsAny<It.IsAnyType>(),
+                It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()))
+            .Callback(new InvocationAction(invocation =>
+            {
+                if ((LogLevel)invocation.Arguments[0] >= LogLevel.Warning)
+                    warnings.Add(invocation.Arguments[2].ToString()!);
+            }));
+        int attempts = 0;
+        var module = CreateModule(clock, () => { attempts++; return connector; }, scaler.Object);
+        module.Logger = logger.Object;
+
+        for (int i = 0; i <= 30; i++)
+        {
+            connector.ReadError = i % 2 == 0 ? null : new InvalidOperationException("Receive failed.");
+            module.Update();
+            clock.Advance(1);
+        }
+
+        Assert.AreEqual(31, connector.Reads);
+        Assert.AreEqual(1, attempts);
+        Assert.AreEqual(0, connector.Teardowns);
+        module.Teardown(); // Flush the receive window even though no further failure occurs.
+        Assert.AreEqual(2, warnings.Count(text => !text.Contains("Summary")));
+        Assert.IsTrue(warnings.Any(text => text.Contains("stage=receive") && text.Contains("Receive failed.")));
+        Assert.IsTrue(warnings.Any(text => text.Contains("stage=processing") && text.Contains("Mapping failed.")));
+        Assert.IsTrue(warnings.Any(text => text.Contains("UpdateFailure/receiveSummary") && text.Contains("14 additional occurrences")));
+        int processingRepeats = warnings.Where(text => text.Contains("UpdateFailure/processingSummary"))
+            .Sum(text => int.Parse(System.Text.RegularExpressions.Regex.Match(text, @"(\d+) additional occurrences").Groups[1].Value));
+        Assert.AreEqual(15, processingRepeats);
+    }
+
+    [TestMethod]
+    public void ExplainSocketRebuildAndSuccessfulRecoveryWithoutRepeatedStacks()
+    {
+        var clock = new RetryClock();
+        var log = new DiagnosticTestLogger();
+        using var first = new RetryConnector { ReadError = new SocketException(10054) };
+        using var second = new RetryConnector { ReadError = new SocketException(10054) };
+        using var third = new RetryConnector();
+        var connectors = new Queue<IPicoConnector>(new[] { first, second, third });
+        var module = CreateModule(clock, () => connectors.Dequeue());
+        module.Logger = log;
+        module.Update();
+        clock.Advance(1);
+        module.Update();
+        clock.Advance(1);
+        module.Update();
+
+        Assert.AreEqual(1, log.Entries.Count(entry => entry.Name == "UpdateFailure/receive"));
+        StringAssert.Contains(log.Single("UpdateFailure/receive").Text,
+            $"socketError={((SocketException)first.ReadError!).ErrorCode}; rebuild local UDP listener; update backoff=1000ms");
+        StringAssert.Contains(log.Single("UpdateFailure/receiveSummary").Text, "1 additional occurrences");
+        Assert.AreEqual(LogLevel.Information, log.Single("ProcessingResumed").Level);
+        StringAssert.Contains(log.Single("ProcessingResumed").Text, "2.000s; update failures=2");
+        module.Teardown();
+    }
+
+    [TestMethod]
+    public void FlushRepeatedConnectionFailuresWhenBindingRecovers()
+    {
+        var clock = new RetryClock();
+        var log = new DiagnosticTestLogger();
+        int attempts = 0;
+        using var connector = new RetryConnector
+        {
+            ConnectAction = () => ++attempts > 2 ? true : throw new InvalidOperationException("Connection failed."),
+        };
+        using var module = CreateModule(clock, () => connector);
+        module.Logger = log;
+        module.Update();
+        clock.Advance(5);
+        module.Update();
+        clock.Advance(5);
+        module.Update();
+        Assert.AreEqual(1, log.Entries.Count(entry => entry.Name == "LogConnectionFailed"));
+        StringAssert.Contains(log.Single("LogConnectionFailedSummary").Text, "1 additional occurrences");
+    }
+
     private static Exception TransportError(bool disposed) => disposed
         ? new ObjectDisposedException("socket")
         : new SocketException(10054);
-
 
 
     private static Mock<IBlendshapeScaler> PassthroughScaler()

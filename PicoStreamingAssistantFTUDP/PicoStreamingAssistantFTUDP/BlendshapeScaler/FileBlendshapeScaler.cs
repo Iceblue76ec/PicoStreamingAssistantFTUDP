@@ -38,6 +38,7 @@ public sealed partial class FileBlendshapeScaler(ILogger logger, IFileSystem fil
                     _unifiedScales.Add(unifiedExpression, jsonProperty.Value.GetSingle());
                 }
             }
+            LogConfigLoaded(configPath, _eyeScales.Count, _unifiedScales.Count);
             return true;
         }
         catch (Exception ex)
@@ -201,6 +202,9 @@ public sealed partial class FileBlendshapeScaler(ILogger logger, IFileSystem fil
         UnifiedExpressions.TongueOut
     ];
 
+
+    [LoggerMessage(LogLevel.Information, "Loaded PICO scaling config {path}; eye scales={eyeCount}; expression scales={expressionCount}.")]
+    private partial void LogConfigLoaded(string path, int eyeCount, int expressionCount);
 
     [LoggerMessage(LogLevel.Debug, "Trying to parse {property}...")]
     private partial void LogDebugTryToParse(string property);

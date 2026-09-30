@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
+using Pico4SAFTExtTrackingModule.Diagnostics;
 
 namespace Pico4SAFTExtTrackingModule.PicoConnectors;
 
@@ -27,7 +28,7 @@ public sealed partial class LegacyConnector : IPicoConnector
     internal LegacyConnector(ILogger logger, PicoPrograms program, int port,
         Func<Socket, Memory<byte>, EndPoint, CancellationToken, ValueTask<SocketReceiveFromResult>>? receive = null)
     {
-        _logger = logger;
+        _logger = PicoDiagnostics.ForLogger(logger).Logger;
         _program = program;
         _port = port;
         _receive = receive ?? ((socket, buffer, endpoint, token) => socket.ReceiveFromAsync(buffer, endpoint, token));
@@ -132,17 +133,19 @@ public sealed partial class LegacyConnector : IPicoConnector
                     MemoryMarshal.Cast<byte, float>(buffer.AsSpan(WeightOffset, WeightBytes)).CopyTo(batchWeights);
                     valid++;
                 }
+                bool superseded = false;
                 if (valid > 0)
                 {
                     lock (session.Gate)
                     {
                         if (session.Closed) return;
+                        superseded = session.HasSample;
                         batchWeights.CopyTo(session.Latest, 0);
                         session.HasSample = true;
                         Monitor.PulseAll(session.Gate);
                     }
                 }
-                ObserveBatch(session, valid, drained == MaxPacketsPerBatch);
+                ObserveBatch(session, valid, drained == MaxPacketsPerBatch, superseded);
                 if (drained == MaxPacketsPerBatch) await Task.Yield();
             }
         }
@@ -203,7 +206,7 @@ public sealed partial class LegacyConnector : IPicoConnector
 
     partial void InitializeDiagnostics(Session session);
     partial void ObservePacket(Session session, int length, byte type, bool accepted, IPEndPoint? sender);
-    partial void ObserveBatch(Session session, int valid, bool limited);
+    partial void ObserveBatch(Session session, int valid, bool limited, bool superseded);
     partial void ObserveIdle(Session session);
     partial void ObserveTimeout(Session session);
     partial void FinishDiagnostics(Session session);

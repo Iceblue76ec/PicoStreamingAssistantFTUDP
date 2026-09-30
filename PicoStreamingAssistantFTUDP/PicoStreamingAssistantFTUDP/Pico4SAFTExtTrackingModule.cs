@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using Pico4SAFTExtTrackingModule.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Pico4SAFTExtTrackingModule.BlendshapeScaler;
 using Pico4SAFTExtTrackingModule.PacketLogger;
@@ -23,6 +24,11 @@ public sealed partial class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDis
     private readonly Func<DateTime> _utcNow;
     private DateTime _nextConnectionAttempt;
     private DateTime _nextUpdateAttempt;
+    private readonly PicoDiagnostics _diagnostics;
+    private ModuleState? _lastStatus;
+    private string? _lastStreamer;
+    private TimeSpan? _failureStarted;
+    private long _failures;
     public static readonly string LoggerPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VRCFaceTracking", "PICOLogs.csv");
     public (bool Eye, bool Expression) TrackingState = (false, false);
     public override (bool SupportsEye, bool SupportsExpression) Supported { get; } = (true, true);
@@ -36,15 +42,28 @@ public sealed partial class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDis
         _connector = connector;
         _scaler = scaler;
         _utcNow = utcNow ?? (() => DateTime.UtcNow);
-        _connectorFactory = connectorFactory ?? (() => ConnectorFactory.Build(Logger,
-            new ProcessRunningProgramChecker(), new ConfigChecker(Logger)));
+        _diagnostics = new PicoDiagnostics(() => Logger, utcNow);
+        _connectorFactory = connectorFactory ?? (() => ConnectorFactory.Build(_diagnostics.Logger,
+            new ProcessRunningProgramChecker(), new ConfigChecker(_diagnostics.Logger)));
     }
 
     public override (bool eyeSuccess, bool expressionSuccess) Initialize(bool eyeAvailable, bool expressionAvailable)
     {
+        try { return InitializeTracking(eyeAvailable, expressionAvailable); }
+        catch (Exception exception)
+        {
+            _diagnostics.Report(LogLevel.Error, "InitializationFailed", "", () => "PICO local initialization failed; the host will skip this module.", exception);
+            throw;
+        }
+    }
+
+    private (bool, bool) InitializeTracking(bool eyeAvailable, bool expressionAvailable)
+    {
         TrackingState = (eyeAvailable, expressionAvailable);
         if ((!eyeAvailable && !expressionAvailable) || Volatile.Read(ref _disposed) != 0) return (false, false);
-        _scaler ??= new FileBlendshapeScalerFactory().Build(Logger);
+        _diagnostics.Logger.LogInformation("PICO module loaded; version={Version}; eye={Eye}; expression={Expression}; repeatWindow=30s.",
+            typeof(Pico4SAFTExtTrackingModule).Assembly.GetName().Version, eyeAvailable, expressionAvailable);
+        _scaler ??= new FileBlendshapeScalerFactory().Build(_diagnostics.Logger);
 #if FILE_LOG
         _logger = PicoDataLoggerFactory.Build(LoggerPath);
 #endif
@@ -64,17 +83,28 @@ public sealed partial class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDis
             Thread.Sleep(100);
             return false;
         }
+        _diagnostics.BeginConnectionAttempt();
         try
         {
             _connector = _connectorFactory();
+            if (_connector == null)
+                _diagnostics.Report(LogLevel.Information, "WaitingForStreamer", "", () => "No streaming program found; probing again in 5000ms.");
+            else if (_lastStreamer != _connector.GetProcessName())
+            {
+                _lastStreamer = _connector.GetProcessName();
+                _diagnostics.Report(LogLevel.Information, "StreamerSelected", _lastStreamer, () => $"Selected {_lastStreamer}; connector={_connector.GetType().Name}.");
+            }
             if (_connector != null && _connector.Connect())
             {
                 if (Volatile.Read(ref _disposed) != 0) { ResetConnector(); return false; }
                 _nextConnectionAttempt = default;
+                // Preserve signatures, but output pending retry/fault counts on recovery.
+                _diagnostics.Flush();
+                _diagnostics.Report(LogLevel.Information, "ConnectorReady", "", () => "UDP listener ready; waiting for a valid sample. Binding alone does not establish reception.");
                 return true;
             }
         }
-        catch (Exception exception) { LogConnectionFailed(exception); }
+        catch (Exception exception) { LogConnectionFailed(_diagnostics.Logger, exception); }
         ResetConnector();
         _nextConnectionAttempt = _utcNow().AddSeconds(5);
         Thread.Sleep(100);
@@ -84,14 +114,22 @@ public sealed partial class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDis
     private void ResetConnector()
     {
         try { Interlocked.Exchange(ref _connector, null)?.Teardown(); }
-        catch (Exception exception) { LogCleanupFailed(exception); }
+        catch (Exception exception) { LogCleanupFailed(_diagnostics.Logger, exception); }
     }
 
-    private void BackOffUpdate(Exception exception, bool receiving)
+    private void BackOffUpdate(Exception exception, bool receiving, string operation = "read")
     {
         bool rebuild = receiving && exception is ReceiveLoopException or SocketException or ObjectDisposedException;
-        if (exception is ReceiveLoopException) LogReceiveRecovery();
-        else LogUpdateFailed(exception, receiving ? "receive" : "processing", rebuild);
+        _failureStarted ??= _diagnostics.Elapsed;
+        _failures++;
+        _diagnostics.PauseReception();
+        if (exception is ReceiveLoopException)
+            _diagnostics.Report(LogLevel.Warning, "ReceiveRecovery", "", () => "Receive loop stopped; rebuild local UDP listener; update backoff=1000ms. See preceding receiver exception.");
+        else
+            _diagnostics.Report(receiving ? LogLevel.Warning : LogLevel.Error,
+                receiving ? "UpdateFailure/receive" : "UpdateFailure/processing", operation, () =>
+                $"stage={(receiving ? "receive" : "processing")}; operation={operation}; socketError={(exception is SocketException socket ? socket.ErrorCode.ToString() : "none")}; " +
+                $"{(rebuild ? "rebuild local UDP listener" : "retain connector")}; update backoff=1000ms.", exception);
         if (rebuild) ResetConnector();
         _nextUpdateAttempt = _utcNow().AddSeconds(1);
     }
@@ -201,18 +239,27 @@ public sealed partial class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDis
     public override void Update()
     {
         if (Volatile.Read(ref _disposed) != 0) return;
+        _diagnostics.Tick();
+        if (_lastStatus != Status)
+        {
+            _diagnostics.Report(LogLevel.Information, "ModuleState", Status.ToString(), () => $"Module state changed to {Status}.");
+            _lastStatus = Status;
+        }
         if (Status != ModuleState.Active || _utcNow() < _nextUpdateAttempt)
         {
+            _diagnostics.PauseReception();
             Thread.Sleep(100);
             return;
         }
         if (_connector == null && !TryConnect()) return;
         var connector = _connector;
         if (connector == null) return;
+        _diagnostics.ResumeReception();
         ReadOnlySpan<float> shapes;
         try { shapes = connector.GetBlendShapes(); }
         catch (Exception exception) { BackOffUpdate(exception, receiving: true); return; }
         if (shapes.IsEmpty) return;
+        string operation = "csv-snapshot";
         try
         {
             if (_logger != null)
@@ -223,30 +270,46 @@ public sealed partial class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDis
             Span<UnifiedExpressionShape> unified = UnifiedTracking.Data.Shapes;
             if (TrackingState.Eye)
             {
+                operation = "eye-gaze-openness";
                 UpdateEye(shapes, ref UnifiedTracking.Data.Eye.Left, ref UnifiedTracking.Data.Eye.Right);
+                operation = "eye-expressions";
                 UpdateEyeExpression(shapes, unified);
             }
-            if (TrackingState.Expression) UpdateExpression(shapes, unified);
+            if (TrackingState.Expression)
+            {
+                operation = "expressions";
+                UpdateExpression(shapes, unified);
+            }
+            if (_failureStarted is { } started)
+            {
+                _diagnostics.Flush("UpdateFailure/");
+                _diagnostics.Flush("ReceiveRecovery");
+                _diagnostics.Report(LogLevel.Information, "ProcessingResumed", "", () => $"Tracking processing resumed after {(_diagnostics.Elapsed - started).TotalSeconds:F3}s; update failures={_failures}.");
+                _failureStarted = null;
+                _failures = 0;
+            }
         }
-        catch (Exception exception) { BackOffUpdate(exception, receiving: false); }
+        catch (Exception exception) { BackOffUpdate(exception, receiving: false, operation); }
     }
 
     public override void Teardown() => Dispose();
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        ResetConnector();
-        _logger?.Dispose();
-        _logger = null;
+        _diagnostics.PauseReception();
+        _diagnostics.Report(LogLevel.Information, "ModuleShutdown", "", () => $"Shutting down PICO module; unresolved update failures={_failures}.");
+        try
+        {
+            ResetConnector();
+            _logger?.Dispose();
+            _logger = null;
+        }
+        finally { _diagnostics.Flush(forget: true); }
         GC.SuppressFinalize(this);
     }
 
     [LoggerMessage(LogLevel.Warning, "Service discovery or connection failed; retry in 5000ms.")]
-    private partial void LogConnectionFailed(Exception exception);
+    private static partial void LogConnectionFailed(ILogger logger, Exception exception);
     [LoggerMessage(LogLevel.Warning, "Could not close the connector; recovery will continue.")]
-    private partial void LogCleanupFailed(Exception exception);
-    [LoggerMessage(LogLevel.Warning, "stage={stage}; rebuild={rebuild}; update backoff=1000ms.")]
-    private partial void LogUpdateFailed(Exception exception, string stage, bool rebuild);
-    [LoggerMessage(LogLevel.Warning, "Receive loop stopped; rebuilding local listener after 1000ms.")]
-    private partial void LogReceiveRecovery();
+    private static partial void LogCleanupFailed(ILogger logger, Exception exception);
 }

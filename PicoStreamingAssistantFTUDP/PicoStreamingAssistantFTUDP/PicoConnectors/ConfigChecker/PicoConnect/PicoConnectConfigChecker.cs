@@ -47,7 +47,7 @@ public sealed partial class PicoConnectConfigChecker(ILogger logger, IFileSystem
         return picoConfig.Lab.FaceTrackingTransferProtocol;
     }
 
-    [LoggerMessage(LogLevel.Information, "Expecting PICO settings file at '{path}'")]
+    [LoggerMessage(LogLevel.Debug, "Expecting PICO settings file at '{path}'")]
     private partial void LogConfigPath(string path);
 
     [LoggerMessage(LogLevel.Error, "Pico Config deserialize failed.")]

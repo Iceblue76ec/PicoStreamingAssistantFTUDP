@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.Logging;
+using Pico4SAFTExtTrackingModule.Diagnostics;
 
 using Pico4SAFTExtTrackingModule.PicoConnectors.ConfigChecker;
 using Pico4SAFTExtTrackingModule.PicoConnectors.ProgramChecker;
@@ -9,12 +10,23 @@ public static partial class ConnectorFactory
 {
     public static IPicoConnector? Build(ILogger logger, IProgramChecker programChecker, IConfigChecker configChecker)
     {
-        if (programChecker.Check(PicoPrograms.PicoConnect))
+        var diagnostics = PicoDiagnostics.ForLogger(logger);
+        logger = diagnostics.Logger;
+        bool pc = programChecker.Check(PicoPrograms.PicoConnect);
+        bool bs = programChecker.Check(PicoPrograms.BusinessStreaming);
+        bool bs1 = programChecker.Check(PicoPrograms.BusinessStreamingV1);
+        bool sa = programChecker.Check(PicoPrograms.StreamingAssistant);
+        diagnostics.Report(LogLevel.Debug, "StreamingProgramProbe", $"{pc}/{bs}/{bs1}/{sa}", () =>
+            $"Streaming programs: PicoConnect={pc}; BusinessStreaming={bs}; BusinessStreamingV1={bs1}; StreamingAssistant={sa}.");
+        if (pc)
         {
             logger.LogPicoConnect();
             try
             {
-                return configChecker.GetTransferProtocolNumber(PicoPrograms.PicoConnect) switch
+                int protocol = configChecker.GetTransferProtocolNumber(PicoPrograms.PicoConnect);
+                diagnostics.Report(LogLevel.Information, "PicoConnectProtocol", protocol == 2 ? "legacy" : "unsupported", () =>
+                    $"PicoConnect faceTrackingTransferProtocol={protocol}; decoder={(protocol == 2 ? "legacy" : "unsupported")}.");
+                return protocol switch
                 {
                     2 => new LegacyConnector(logger, PicoPrograms.PicoConnect), // using legacy protocol
                     _ => new PicoConnectConnector(logger), // couldn't get / using latest protocol
@@ -26,17 +38,20 @@ public static partial class ConnectorFactory
             }
         }
 
-        if (programChecker.Check(PicoPrograms.BusinessStreaming))
+        if (bs)
         {
             logger.LogBusinessStreaming();
             try
             {
-                return configChecker.GetTransferProtocolNumber(PicoPrograms.BusinessStreaming) switch
+                int protocol = configChecker.GetTransferProtocolNumber(PicoPrograms.BusinessStreaming);
+                diagnostics.Report(LogLevel.Information, "BusinessStreamingProtocol", protocol == 2 ? "legacy" : "unsupported", () =>
+                    $"BusinessStreaming faceTrackingTransferProtocol={protocol}; decoder={(protocol == 2 ? "legacy" : "unsupported")}.");
+                return protocol switch
                 {
                     2 => new LegacyConnector(logger, PicoPrograms.BusinessStreaming), // using legacy protocol
 
                     // TODO is the protocol the same as PicoConnect? can we use the same connector (once it's implemented)?
-                    _ => new PicoConnectConnector(logger),// couldn't get / using latest protocol
+                    _ => new PicoConnectConnector(logger, PicoPrograms.BusinessStreaming),// couldn't get / using latest protocol
                 };
             }
             catch (Exception ex)
@@ -45,10 +60,10 @@ public static partial class ConnectorFactory
             }
         }
 
-        if (programChecker.Check(PicoPrograms.BusinessStreamingV1))
+        if (bs1)
             return new LegacyConnector(logger, PicoPrograms.BusinessStreamingV1);
 
-        if (programChecker.Check(PicoPrograms.StreamingAssistant))
+        if (sa)
             return new LegacyConnector(logger, PicoPrograms.StreamingAssistant);
 
         return null; // none found
