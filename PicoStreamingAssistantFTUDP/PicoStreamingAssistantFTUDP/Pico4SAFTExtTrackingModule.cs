@@ -108,7 +108,7 @@ public sealed partial class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDis
         left.Gaze.y = _scaler.EyeExpressionShapeScale(pxrShape[(int)BlendShapeIndex.EyeLookUp_L] - pxrShape[(int)BlendShapeIndex.EyeLookDown_L], EyeExpressions.EyeYGazeLeft);
 
         right.Gaze.x = _scaler.EyeExpressionShapeScale(pxrShape[(int)BlendShapeIndex.EyeLookOut_R] - pxrShape[(int)BlendShapeIndex.EyeLookIn_R], EyeExpressions.EyeXGazeRight);
-        right.Gaze.y = _scaler.EyeExpressionShapeScale(pxrShape[(int)BlendShapeIndex.EyeLookUp_R] - pxrShape[(int)BlendShapeIndex.EyeLookDown_R], EyeExpressions.EyeXGazeLeft);
+        right.Gaze.y = _scaler.EyeExpressionShapeScale(pxrShape[(int)BlendShapeIndex.EyeLookUp_R] - pxrShape[(int)BlendShapeIndex.EyeLookDown_R], EyeExpressions.EyeYGazeRight);
     }
 
     private void UpdateEyeExpression(ReadOnlySpan<float> pxrShape, Span<UnifiedExpressionShape> unifiedShape)
