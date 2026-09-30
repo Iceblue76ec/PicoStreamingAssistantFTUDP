@@ -1,14 +1,11 @@
-﻿using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
-
+using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
-
 using Pico4SAFTExtTrackingModule.BlendshapeScaler;
 using Pico4SAFTExtTrackingModule.PacketLogger;
 using Pico4SAFTExtTrackingModule.PicoConnectors;
 using Pico4SAFTExtTrackingModule.PicoConnectors.ConfigChecker;
 using Pico4SAFTExtTrackingModule.PicoConnectors.ProgramChecker;
-
+using System.Diagnostics;
 using VRCFaceTracking;
 using VRCFaceTracking.Core.Library;
 using VRCFaceTracking.Core.Params.Data;
@@ -16,80 +13,87 @@ using VRCFaceTracking.Core.Params.Expressions;
 
 namespace Pico4SAFTExtTrackingModule;
 
-public sealed partial class Pico4SAFTExtTrackingModule(IPicoConnector? connector, IBlendshapeScaler? scaler) : ExtTrackingModule, IDisposable
+public sealed partial class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDisposable
 {
-
-    private bool _disposedValue = false;
-    private IPicoConnector? _connector = connector;
-    private IBlendshapeScaler? _scaler = scaler;
-    private PacketLogger<PxrFTInfo>? _logger = null;
-
-    public static readonly string LoggerPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VRCFaceTracking\\PICOLogs.csv");
+    private int _disposed;
+    private IPicoConnector? _connector;
+    private IBlendshapeScaler? _scaler;
+    private PacketLogger<PxrFTInfo>? _logger;
+    private readonly Func<IPicoConnector?> _connectorFactory;
+    private readonly Func<DateTime> _utcNow;
+    private DateTime _nextConnectionAttempt;
+    private DateTime _nextUpdateAttempt;
+    public static readonly string LoggerPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VRCFaceTracking", "PICOLogs.csv");
     public (bool Eye, bool Expression) TrackingState = (false, false);
-
     public override (bool SupportsEye, bool SupportsExpression) Supported { get; } = (true, true);
 
-    public Pico4SAFTExtTrackingModule() : this(null, null)
+    public Pico4SAFTExtTrackingModule() : this(null, null) { }
+    public Pico4SAFTExtTrackingModule(IPicoConnector? connector, IBlendshapeScaler? scaler)
+        : this(connector, scaler, null, null) { }
+    internal Pico4SAFTExtTrackingModule(IPicoConnector? connector, IBlendshapeScaler? scaler,
+        Func<IPicoConnector?>? connectorFactory, Func<DateTime>? utcNow)
     {
-    }
-
-    [MemberNotNullWhen(true, nameof(_connector))]
-    private bool StreamerValidity()
-    {
-        _connector = ConnectorFactory.Build(Logger, new ProcessRunningProgramChecker(), new ConfigChecker(Logger));
-        if (_connector is null)
-        {
-            LogErrorNoProcess();
-            return false;
-        }
-
-        LogProcessName(_connector.GetProcessName());
-        return true;
+        _connector = connector;
+        _scaler = scaler;
+        _utcNow = utcNow ?? (() => DateTime.UtcNow);
+        _connectorFactory = connectorFactory ?? (() => ConnectorFactory.Build(Logger,
+            new ProcessRunningProgramChecker(), new ConfigChecker(Logger)));
     }
 
     public override (bool eyeSuccess, bool expressionSuccess) Initialize(bool eyeAvailable, bool expressionAvailable)
     {
         TrackingState = (eyeAvailable, expressionAvailable);
-        if (!StreamerValidity() || (eyeAvailable, expressionAvailable) is (false, false))
-        {
-            LogWarningNoData();
-            return (false, false);
-        }
-
-        LogInitializing(_connector.GetProcessName());
-        /*while (!this.disposedValue && !*/
-        _connector.Connect()/*) Thread.Sleep(4_000)*/;
-
-        if (_disposedValue)
-        {
-            LogWarningNoConnection();
-            return (false, false);
-        }
-
-        _scaler = new FileBlendshapeScalerFactory().Build(Logger);
-
+        if ((!eyeAvailable && !expressionAvailable) || Volatile.Read(ref _disposed) != 0) return (false, false);
+        _scaler ??= new FileBlendshapeScalerFactory().Build(Logger);
 #if FILE_LOG
         _logger = PicoDataLoggerFactory.Build(LoggerPath);
-        LogFileLogPath(LoggerPath);
 #endif
-
-
         ModuleInformation.Name = "Pico 4 Pro / Enterprise";
-
         if (typeof(Pico4SAFTExtTrackingModule).Assembly.GetManifestResourceStream("pico-hmd.png") is { } stream)
         {
-            if (ModuleInformation.StaticImages is null)
-                ModuleInformation.StaticImages = [stream];
-            else
-                ModuleInformation.StaticImages.Add(stream);
+            if (ModuleInformation.StaticImages == null) ModuleInformation.StaticImages = [stream];
+            else ModuleInformation.StaticImages.Add(stream);
         }
-
-        if (!TrackingState.Eye)
-            LogEyeReady();
-        if (!TrackingState.Expression)
-            LogExpressionReady();
-
         return TrackingState;
+    }
+
+    private bool TryConnect()
+    {
+        if (_utcNow() < _nextConnectionAttempt)
+        {
+            Thread.Sleep(100);
+            return false;
+        }
+        try
+        {
+            _connector = _connectorFactory();
+            if (_connector != null && _connector.Connect())
+            {
+                if (Volatile.Read(ref _disposed) != 0) { ResetConnector(); return false; }
+                _nextConnectionAttempt = default;
+                return true;
+            }
+        }
+        catch (Exception exception) { LogConnectionFailed(exception); }
+        ResetConnector();
+        _nextConnectionAttempt = _utcNow().AddSeconds(5);
+        Thread.Sleep(100);
+        return false;
+    }
+
+    private void ResetConnector()
+    {
+        try { Interlocked.Exchange(ref _connector, null)?.Teardown(); }
+        catch (Exception exception) { LogCleanupFailed(exception); }
+    }
+
+    private void BackOffUpdate(Exception exception, bool receiving)
+    {
+        bool rebuild = receiving && exception is ReceiveLoopException or SocketException or ObjectDisposedException;
+        if (exception is ReceiveLoopException) LogReceiveRecovery();
+        else LogUpdateFailed(exception, receiving ? "receive" : "processing", rebuild);
+        if (rebuild) ResetConnector();
+        _nextUpdateAttempt = _utcNow().AddSeconds(1);
     }
 
     private void UpdateEye(ReadOnlySpan<float> pxrShape, ref UnifiedSingleEyeData left, ref UnifiedSingleEyeData right)
@@ -196,101 +200,53 @@ public sealed partial class Pico4SAFTExtTrackingModule(IPicoConnector? connector
 
     public override void Update()
     {
-        Debug.Assert(_connector is not null);
-        if (Status != ModuleState.Active)
+        if (Volatile.Read(ref _disposed) != 0) return;
+        if (Status != ModuleState.Active || _utcNow() < _nextUpdateAttempt)
         {
             Thread.Sleep(100);
             return;
         }
-
+        if (_connector == null && !TryConnect()) return;
+        var connector = _connector;
+        if (connector == null) return;
+        ReadOnlySpan<float> shapes;
+        try { shapes = connector.GetBlendShapes(); }
+        catch (Exception exception) { BackOffUpdate(exception, receiving: true); return; }
+        if (shapes.IsEmpty) return;
         try
         {
-            ReadOnlySpan<float> pxrShape = _connector.GetBlendShapes();
-            if (pxrShape.IsEmpty)
-                return;
-
             if (_logger != null)
             {
-                // legacy; PacketLogger#UpdateValue needs a PxrFTInfo; but we don't want to send that outside from the PicoConnector
-                PxrFTInfo data = PicoDataLoggerHelper.FillPxrFTInfo(pxrShape);
+                var data = PicoDataLoggerHelper.FillPxrFTInfo(shapes);
                 _logger.UpdateValue(data);
             }
-
-            Span<UnifiedExpressionShape> unifiedShape = UnifiedTracking.Data.Shapes;
-
+            Span<UnifiedExpressionShape> unified = UnifiedTracking.Data.Shapes;
             if (TrackingState.Eye)
             {
-                ref var pLeft = ref UnifiedTracking.Data.Eye.Left;
-                ref var pRight = ref UnifiedTracking.Data.Eye.Right;
-                UpdateEye(pxrShape, ref pLeft, ref pRight);
-                UpdateEyeExpression(pxrShape, unifiedShape);
+                UpdateEye(shapes, ref UnifiedTracking.Data.Eye.Left, ref UnifiedTracking.Data.Eye.Right);
+                UpdateEyeExpression(shapes, unified);
             }
-
-            if (TrackingState.Expression)
-                UpdateExpression(pxrShape, unifiedShape);
+            if (TrackingState.Expression) UpdateExpression(shapes, unified);
         }
-        catch (Exception ex)
-        {
-            LogException(ex);
-        }
+        catch (Exception exception) { BackOffUpdate(exception, receiving: false); }
     }
 
     public override void Teardown() => Dispose();
-
-    private void Dispose(bool disposing)
-    {
-        if (_disposedValue)
-            return;
-
-        if (disposing)
-        {
-            _connector?.Teardown();
-            _connector = null;
-            _logger?.Dispose();
-            _logger = null;
-        }
-
-        _disposedValue = true;
-    }
-
-    // ~Pico4SAFTExtTrackingModule()
-    // {
-    //     Dispose(disposing: false);
-    // }
-
     public void Dispose()
     {
-        Dispose(disposing: true);
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        ResetConnector();
+        _logger?.Dispose();
+        _logger = null;
         GC.SuppressFinalize(this);
     }
 
-    [LoggerMessage(LogLevel.Information, "Using {process}")]
-    private partial void LogProcessName(string process);
-
-    [LoggerMessage(LogLevel.Information, "Initializing {process} data stream.")]
-    private partial void LogInitializing(string process);
-
-    [LoggerMessage(LogLevel.Information, "Using {path} path for PICO logs.")]
-    private partial void LogFileLogPath(string path);
-
-    [LoggerMessage(LogLevel.Information, "Eye tracking already in use, disabling eye data.")]
-    private partial void LogEyeReady();
-
-    [LoggerMessage(LogLevel.Information, "Expression Tracking already in use, disabling expression data.")]
-    private partial void LogExpressionReady();
-
-    [LoggerMessage(LogLevel.Warning, "No data is usable, skipping initialization.")]
-    private partial void LogWarningNoData();
-
-    [LoggerMessage(LogLevel.Warning, "Module failed to establish a connection.")]
-    private partial void LogWarningNoConnection();
-
-    [LoggerMessage(LogLevel.Warning, "Unexpected exceptions")]
-    private partial void LogException(Exception exception);
-
-    [LoggerMessage(
-        LogLevel.Error,
-        "\"Streaming Assistant\", \"Business Streaming\" or \"PICO Connect\" process was not found. " +
-        "Please run the Streaming Assistant or PICO Connect before VRCFaceTracking.")]
-    private partial void LogErrorNoProcess();
+    [LoggerMessage(LogLevel.Warning, "Service discovery or connection failed; retry in 5000ms.")]
+    private partial void LogConnectionFailed(Exception exception);
+    [LoggerMessage(LogLevel.Warning, "Could not close the connector; recovery will continue.")]
+    private partial void LogCleanupFailed(Exception exception);
+    [LoggerMessage(LogLevel.Warning, "stage={stage}; rebuild={rebuild}; update backoff=1000ms.")]
+    private partial void LogUpdateFailed(Exception exception, string stage, bool rebuild);
+    [LoggerMessage(LogLevel.Warning, "Receive loop stopped; rebuilding local listener after 1000ms.")]
+    private partial void LogReceiveRecovery();
 }

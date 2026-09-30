@@ -15,6 +15,22 @@ namespace Pico4SAFTExtTrackingModule;
 [TestClass]
 public class Pico4ModuleShould
 {
+    [TestMethod]
+    public void PublishIdentityWithoutProbingTheStreamingService()
+    {
+        int probes = 0;
+        using var module = new Pico4SAFTExtTrackingModule(null, GetScalerMock().Object,
+            () => { probes++; throw new InvalidOperationException("probe failed"); }, null)
+        {
+            Logger = Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance,
+            ModuleInformation = new ModuleMetadata(),
+        };
+        Assert.AreEqual((true, true), module.Initialize(true, true));
+        Assert.AreEqual("Pico 4 Pro / Enterprise", module.ModuleInformation.Name);
+        Assert.AreEqual(1, module.ModuleInformation.StaticImages.Count);
+        Assert.AreEqual(0, probes);
+    }
+
     /// <summary>
     /// Creates and configures a mock implementation of <see cref="IBlendshapeScaler"/>.
     /// The mock returns the input value unchanged for both <c>EyeExpressionShapeScale</c>
