@@ -1,4 +1,6 @@
 ﻿using System.Text;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 using Pico4SAFTExtTrackingModule.PicoConnectors;
 
@@ -7,7 +9,10 @@ namespace Pico4SAFTExtTrackingModule.PacketLogger;
 public sealed class PicoDataLoggerFactory
 {
     public static PacketLogger<PxrFTInfo> Build(string path)
-        => new(path, new PicoDataExtractor());
+        => Build(path, NullLogger.Instance);
+
+    public static PacketLogger<PxrFTInfo> Build(string path, ILogger logger)
+        => new(path, new PicoDataExtractor(), logger);
 }
 
 file sealed class PicoDataExtractor : IDataExtractor<PxrFTInfo>

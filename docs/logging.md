@@ -138,3 +138,12 @@ Processing exceptions keep the connector; both record
 a 1000ms update backoff.
 Service probe/connection failure records a 5000ms connection backoff. The receiver logs the original exception once; the module recovery decision references
 that detail without repeating its stack. Expected cancellation during teardown is silent.
+
+## Optional CSV capture
+
+CSV remains disabled unless the module is built with `FILE_LOG`. Its background writer
+waits on a capacity-one Channel. A new sample replaces the pending older sample while
+a row is being written; Update never waits for disk I/O. This capture is a diagnostic
+sample stream, not a lossless recording. Normal teardown completes the Channel, drains
+the pending sample and flushes the writer. A file or row write failure stops CSV and
+records one Error; tracking continues. Abrupt process termination may lose buffered CSV.

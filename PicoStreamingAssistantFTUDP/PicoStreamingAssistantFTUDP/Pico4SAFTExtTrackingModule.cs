@@ -65,7 +65,7 @@ public sealed partial class Pico4SAFTExtTrackingModule : ExtTrackingModule, IDis
             typeof(Pico4SAFTExtTrackingModule).Assembly.GetName().Version, eyeAvailable, expressionAvailable);
         _scaler ??= new FileBlendshapeScalerFactory().Build(_diagnostics.Logger);
 #if FILE_LOG
-        _logger = PicoDataLoggerFactory.Build(LoggerPath);
+        _logger = PicoDataLoggerFactory.Build(LoggerPath, _diagnostics.Logger);
 #endif
         ModuleInformation.Name = "Pico 4 Pro / Enterprise";
         if (typeof(Pico4SAFTExtTrackingModule).Assembly.GetManifestResourceStream("pico-hmd.png") is { } stream)
