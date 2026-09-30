@@ -1,202 +1,219 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-
 using Microsoft.Extensions.Logging;
 
 namespace Pico4SAFTExtTrackingModule.PicoConnectors;
 
-/// <summary>
-/// Connector class for Streaming Assitant & Business Streaming.
-/// Also used for PICO Connect on `mergetype=2`
-/// </summary>
 public sealed partial class LegacyConnector : IPicoConnector
 {
-    private const string IP_ADDRESS = "127.0.0.1";
-    private const int PORT_NUMBER = 29765;
-
-    private static readonly int s_pxrHeaderSize = Unsafe.SizeOf<TrackingDataHeader>();
-    private static readonly int s_pxrFtInfoSize = Unsafe.SizeOf<PxrFTInfo>();
-    private static readonly int s_packetIndex = s_pxrHeaderSize;
-    private static readonly int s_packetSize = s_pxrHeaderSize + s_pxrFtInfoSize;
-
+    private const int HeaderSize = 16;
+    private const int WeightOffset = HeaderSize + sizeof(long);
+    private const int WeightBytes = Pxr.BLEND_SHAPE_NUMS * sizeof(float);
+    internal const int MinimumPacketSize = WeightOffset + WeightBytes;
+    private const int MaxPacketsPerBatch = 1024;
+    private readonly object _lifecycleGate = new();
     private readonly ILogger _logger;
-    private readonly string _processName;
+    private readonly PicoPrograms _program;
+    private readonly int _port;
+    private readonly Func<Socket, Memory<byte>, EndPoint, CancellationToken, ValueTask<SocketReceiveFromResult>> _receive;
+    private readonly float[] _consumerWeights = new float[Pxr.BLEND_SHAPE_NUMS];
+    private Session? _session;
 
-    private volatile int _ready; // 0 created 1 success -1 fail
-    private volatile bool _success;
-    private PxrFTInfo _data;
-    private Task _task = Task.CompletedTask;
-    private CancellationTokenSource? _cancellationTokenSource;
+    public LegacyConnector(ILogger logger, PicoPrograms program)
+        : this(logger, program, 29765) { }
 
-    public LegacyConnector(ILogger Logger, PicoPrograms program_using)
+    internal LegacyConnector(ILogger logger, PicoPrograms program, int port,
+        Func<Socket, Memory<byte>, EndPoint, CancellationToken, ValueTask<SocketReceiveFromResult>>? receive = null)
     {
-        _logger = Logger;
-
-        _processName = program_using switch
-        {
-            PicoPrograms.StreamingAssistant => "Streaming Assistant",
-            PicoPrograms.BusinessStreamingV1 or PicoPrograms.BusinessStreaming => "Business Streaming",
-            PicoPrograms.PicoConnect => "PICO Connect",
-            _ => string.Empty,
-        };
-
-        if (string.IsNullOrEmpty(_processName))
-        {
-            // shouldn't reach this
-            LogWarningUnknownProcess(program_using);
-            _processName = "[?]";
-        }
+        _logger = logger;
+        _program = program;
+        _port = port;
+        _receive = receive ?? ((socket, buffer, endpoint, token) => socket.ReceiveFromAsync(buffer, endpoint, token));
     }
 
-    public string GetProcessName() => _processName;
+    internal IPEndPoint? LocalEndPoint => Volatile.Read(ref _session)?.Socket.LocalEndPoint as IPEndPoint;
+
+    public string GetProcessName() => _program switch
+    {
+        PicoPrograms.StreamingAssistant => "Streaming Assistant",
+        PicoPrograms.BusinessStreamingV1 or PicoPrograms.BusinessStreaming => "Business Streaming",
+        PicoPrograms.PicoConnect => "PICO Connect",
+        _ => "[?]",
+    };
 
     public bool Connect()
     {
-        for (int retry = 0; retry < 3; retry++)
+        lock (_lifecycleGate)
         {
-            _cancellationTokenSource?.Cancel();
-            _task.Wait();
-
-            _cancellationTokenSource = new();
-            _task = StartListening(_cancellationTokenSource.Token);
-
-            SpinWait.SpinUntil(() => Interlocked.CompareExchange(ref _ready, 1, 1) is not 0);
-
-            return _ready is 1;
+            if (_session != null) return true;
+            Socket socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            Session? session = null;
+            try
+            {
+                socket.Bind(new IPEndPoint(IPAddress.Any, _port));
+                session = new Session(socket);
+                InitializeDiagnostics(session);
+                Volatile.Write(ref _session, session);
+                LogBound(socket.LocalEndPoint!, GetProcessName());
+                session.Task = Task.Run(() => ReceiveLoopAsync(session));
+                return true;
+            }
+            catch (Exception exception)
+            {
+                socket.Dispose();
+                session?.Cancellation.Dispose();
+                Volatile.Write(ref _session, null);
+                LogBindFailed(exception, _port);
+                return false;
+            }
         }
-
-        return false;
     }
 
+    // One Update consumer owns this snapshot until its next call. The receiver only
+    // writes Session.Latest, so mapping cannot observe a partially overwritten frame.
     public ReadOnlySpan<float> GetBlendShapes()
     {
-        if (!Interlocked.CompareExchange(ref _success, false, true))
-            return [];
+        Session? session = Volatile.Read(ref _session);
+        if (session == null) return [];
+        bool received = false;
+        lock (session.Gate)
+        {
+            long waitStarted = Stopwatch.GetTimestamp();
+            while (!session.HasSample && !session.Closed && session.Failure == null)
+            {
+                int remaining = 100 - (int)Stopwatch.GetElapsedTime(waitStarted).TotalMilliseconds;
+                if (remaining <= 0) break;
+                Monitor.Wait(session.Gate, remaining);
+            }
+            if (!session.Closed && session.Failure != null) throw new ReceiveLoopException(session.Failure);
+            if (!session.Closed && session.HasSample)
+            {
+                session.Latest.CopyTo(_consumerWeights, 0);
+                session.HasSample = false;
+                received = true;
+            }
+        }
+        ObserveIdle(session);
+        return received ? _consumerWeights : [];
+    }
 
-        return _data.blendShapeWeight;
+    private async Task ReceiveLoopAsync(Session session)
+    {
+        CancellationToken token = session.Cancellation.Token;
+        // Large datagrams are harmless suffixes; never allocate an array per packet.
+        byte[] buffer = new byte[ushort.MaxValue];
+        float[] batchWeights = new float[Pxr.BLEND_SHAPE_NUMS];
+        EndPoint endpoint = new IPEndPoint(IPAddress.Any, 0);
+        try
+        {
+            while (true)
+            {
+                int valid = 0;
+                int drained = 0;
+                for (; drained < MaxPacketsPerBatch; drained++)
+                {
+                    token.ThrowIfCancellationRequested();
+                    if (drained > 0 && session.Socket.Available == 0) break;
+                    SocketReceiveFromResult result;
+                    try { result = await _receive(session.Socket, buffer, endpoint, token).ConfigureAwait(false); }
+                    catch (SocketException exception) when (exception.SocketErrorCode == SocketError.TimedOut)
+                    {
+                        ObserveTimeout(session);
+                        await Task.Delay(100, token).ConfigureAwait(false);
+                        break;
+                    }
+                    int length = result.ReceivedBytes;
+                    bool accepted = length >= MinimumPacketSize && buffer[2] == 2;
+                    ObservePacket(session, length, length >= 3 ? buffer[2] : (byte)0,
+                        accepted, result.RemoteEndPoint as IPEndPoint);
+                    if (!accepted) continue;
+                    MemoryMarshal.Cast<byte, float>(buffer.AsSpan(WeightOffset, WeightBytes)).CopyTo(batchWeights);
+                    valid++;
+                }
+                if (valid > 0)
+                {
+                    lock (session.Gate)
+                    {
+                        if (session.Closed) return;
+                        batchWeights.CopyTo(session.Latest, 0);
+                        session.HasSample = true;
+                        Monitor.PulseAll(session.Gate);
+                    }
+                }
+                ObserveBatch(session, valid, drained == MaxPacketsPerBatch);
+                if (drained == MaxPacketsPerBatch) await Task.Yield();
+            }
+        }
+        catch (Exception exception) when (token.IsCancellationRequested)
+        {
+            // Closing a socket can surface cancellation, disposal or a socket error.
+            _ = exception;
+        }
+        catch (Exception exception)
+        {
+            // Write the original detail before exposing the fault to Update, whose
+            // recovery message references this entry. No sample lock spans logging.
+            try { LogReceiveFailed(exception); } catch { /* Logging must not fault cleanup. */ }
+            lock (session.Gate)
+            {
+                session.Failure = exception;
+                Monitor.PulseAll(session.Gate);
+            }
+        }
+        finally
+        {
+            session.Socket.Dispose();
+            session.Cancellation.Dispose();
+            FinishDiagnostics(session);
+        }
     }
 
     public void Teardown()
     {
-        LogTeardown();
-
-        _cancellationTokenSource?.Cancel();
-        _task.Wait();
+        Session? session;
+        lock (_lifecycleGate)
+        {
+            session = _session;
+            if (session == null) return;
+            Volatile.Write(ref _session, null);
+            lock (session.Gate)
+            {
+                session.Closed = true;
+                Monitor.PulseAll(session.Gate);
+            }
+            try { session.Cancellation.Cancel(); } catch (ObjectDisposedException) { }
+            session.Socket.Dispose();
+        }
+        if (!session.Task.Wait(TimeSpan.FromSeconds(1))) LogShutdownTimeout();
     }
 
-    private async Task StartListening(CancellationToken cancellationToken)
+    private sealed partial class Session(Socket socket)
     {
-        Interlocked.Exchange(ref _ready, 0);
-        byte[] buffer = GC.AllocateUninitializedArray<byte>(s_packetSize * 2);
-        IPEndPoint endPoint = new(IPAddress.Parse(IP_ADDRESS), PORT_NUMBER);
-        using Socket socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        socket.Bind(new IPEndPoint(IPAddress.Any, PORT_NUMBER));
-
-        LogDebugHostEndpoint(endPoint);
-        LogDebugTimeout(socket.ReceiveTimeout);
-        LogDebugEstablished();
-
-        LogWaiting(_processName);
-
-        try
-        {
-            if (!await ReceivePxrDataAsync(cancellationToken))
-            {
-                Interlocked.Exchange(ref _ready, -1);
-
-                return;
-            }
-        }
-        catch (SocketException ex) when (ex.ErrorCode is 10048)
-        {
-            // pico_et_ft_bt_bridge.exe is obsoluted
-            Interlocked.Exchange(ref _ready, -1);
-            return;
-        }
-        catch (Exception e)
-        {
-            LogWarning(e);
-            Interlocked.Exchange(ref _ready, -1);
-            return;
-        }
-
-        LogHandshakeSuccess(_processName);
-        socket.ReceiveTimeout = 5000;
-
-        Interlocked.Exchange(ref _ready, 1);
-        while (true)
-        {
-            Interlocked.Exchange(ref _success, await ReceivePxrDataAsync(cancellationToken));
-        }
-
-        async Task<bool> ReceivePxrDataAsync(CancellationToken cancellationToken)
-        {
-            try
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var result = await socket.ReceiveFromAsync(buffer, endPoint, cancellationToken);
-                if (result.ReceivedBytes is 0)
-                    return false;
-
-                var span = buffer.AsSpan(..result.ReceivedBytes);
-
-                // 0 copy cast
-                ref var tdh = ref MemoryMarshal.AsRef<TrackingDataHeader>(span);
-                if (tdh.tracking_type != 2)
-                    return false;
-
-                // clone
-                _data = MemoryMarshal.AsRef<PxrFTInfo>(span[s_packetIndex..]);
-
-                return true;
-            }
-            catch (SocketException ex) when (ex.ErrorCode is 10060)
-            {
-                // socket time out
-                LogDebugReceivePxrDataError(ex);
-            }
-            catch (SocketException ex) when (ex.ErrorCode is 10004)
-            {
-                LogSocketClosed();
-            }
-            return false;
-        }
+        internal readonly object Gate = new();
+        internal readonly Socket Socket = socket;
+        internal readonly CancellationTokenSource Cancellation = new();
+        internal readonly float[] Latest = new float[Pxr.BLEND_SHAPE_NUMS];
+        internal Task Task = Task.CompletedTask;
+        internal bool HasSample;
+        internal bool Closed;
+        internal Exception? Failure;
     }
 
-    [LoggerMessage(LogLevel.Warning, "Unhandled Exception")]
-    private partial void LogWarning(Exception exception);
+    partial void InitializeDiagnostics(Session session);
+    partial void ObservePacket(Session session, int length, byte type, bool accepted, IPEndPoint? sender);
+    partial void ObserveBatch(Session session, int valid, bool limited);
+    partial void ObserveIdle(Session session);
+    partial void ObserveTimeout(Session session);
+    partial void FinishDiagnostics(Session session);
 
-    [LoggerMessage(LogLevel.Warning, "Couldn't find the name for program {type}")]
-    private partial void LogWarningUnknownProcess(PicoPrograms type);
-
-    [LoggerMessage(LogLevel.Debug, "Host end-point: {endPoint}")]
-    private partial void LogDebugHostEndpoint(EndPoint endPoint);
-
-    [LoggerMessage(LogLevel.Debug, "Initialization Timeout: {timeout}ms")]
-    private partial void LogDebugTimeout(int timeout);
-
-    [LoggerMessage(LogLevel.Debug, "Client established: attempting to receive PxrFTInfo.")]
-    private partial void LogDebugEstablished();
-
-    [LoggerMessage(LogLevel.Debug, "Data was not sent within the timeout.")]
-    private partial void LogDebugReceivePxrDataError(Exception exception);
-
-    [LoggerMessage(LogLevel.Information, "Waiting for {process} data stream.")]
-    private partial void LogWaiting(string process);
-
-    [LoggerMessage(LogLevel.Information, "{process} handshake success.")]
-    private partial void LogHandshakeSuccess(string process);
-
-    [LoggerMessage(LogLevel.Information, "Disposing of PxrFaceTracking UDP Client.")]
-    private partial void LogTeardown();
-
-    [LoggerMessage(LogLevel.Information, "Data was not sent within the timeout (is headset hibernated?), reinitialize...")]
-    private partial void LogReInitialize();
-
-    [LoggerMessage(LogLevel.Information, "Socket closed")]
-    private partial void LogSocketClosed();
+    [LoggerMessage(LogLevel.Information, "UDP listener bound to {endpoint} for {program}; waiting for face data.")]
+    private partial void LogBound(EndPoint endpoint, string program);
+    [LoggerMessage(LogLevel.Warning, "Could not bind PICO UDP port {port}; connection will be retried.")]
+    private partial void LogBindFailed(Exception exception, int port);
+    [LoggerMessage(LogLevel.Warning, "PICO UDP receiver stopped unexpectedly.")]
+    private partial void LogReceiveFailed(Exception exception);
+    [LoggerMessage(LogLevel.Warning, "PICO UDP receiver did not exit within 1000ms; its socket is closed.")]
+    private partial void LogShutdownTimeout();
 }
