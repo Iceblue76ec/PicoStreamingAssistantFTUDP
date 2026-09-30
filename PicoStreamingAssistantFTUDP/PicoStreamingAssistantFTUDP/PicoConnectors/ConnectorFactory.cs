@@ -8,6 +8,10 @@ namespace Pico4SAFTExtTrackingModule.PicoConnectors;
 
 public static partial class ConnectorFactory
 {
+    // Preserve streamer priority: PICO Connect, Business Streaming 2.x, 1.x,
+    // then Streaming Assistant. Configurable programs support only protocol 2
+    // here (legacy, the Streaming Assistant wire layout); others cannot decode.
+    // Configuration: https://docs.vrcft.io/docs/hardware/vr/pico/pico4pe
     public static IPicoConnector? Build(ILogger logger, IProgramChecker programChecker, IConfigChecker configChecker)
     {
         var diagnostics = PicoDiagnostics.ForLogger(logger);
@@ -28,8 +32,8 @@ public static partial class ConnectorFactory
                     $"PicoConnect faceTrackingTransferProtocol={protocol}; decoder={(protocol == 2 ? "legacy" : "unsupported")}.");
                 return protocol switch
                 {
-                    2 => new LegacyConnector(logger, PicoPrograms.PicoConnect), // using legacy protocol
-                    _ => new PicoConnectConnector(logger), // couldn't get / using latest protocol
+                    2 => new LegacyConnector(logger, PicoPrograms.PicoConnect),
+                    _ => new PicoConnectConnector(logger),
                 };
             }
             catch (Exception ex)
@@ -48,7 +52,7 @@ public static partial class ConnectorFactory
                     $"BusinessStreaming faceTrackingTransferProtocol={protocol}; decoder={(protocol == 2 ? "legacy" : "unsupported")}.");
                 return protocol switch
                 {
-                    2 => new LegacyConnector(logger, PicoPrograms.BusinessStreaming), // using legacy protocol
+                    2 => new LegacyConnector(logger, PicoPrograms.BusinessStreaming),
 
                     // TODO is the protocol the same as PicoConnect? can we use the same connector (once it's implemented)?
                     _ => new PicoConnectConnector(logger, PicoPrograms.BusinessStreaming),// couldn't get / using latest protocol

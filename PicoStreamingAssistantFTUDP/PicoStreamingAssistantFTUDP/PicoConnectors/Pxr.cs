@@ -84,6 +84,14 @@ public enum BlendShapeIndex
     sil = 71
 };
 
+// Legacy datagram layout: 16-byte header followed by PxrFTInfo.
+// Offsets: start codes 0..1, tracking_type 2, sub_type 3, multi_packet 4,
+// current_packet_index 5, version 6..7, header timestamp 8..15.
+// The receiver checks only tracking_type == 2. It does not validate the start
+// codes/version or read either timestamp. See docs/connector.md for boundaries.
+// multi_packet/current_packet_index are not interpreted: there is no fragment
+// assembly. All 72 weights must fit in one datagram, even if these fields are set.
+// Configuration: https://docs.vrcft.io/docs/hardware/vr/pico/pico4pe
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct TrackingDataHeader
 {
@@ -97,6 +105,12 @@ public struct TrackingDataHeader
     public ulong timestamp;
 };
 
+// Full payload: 892 bytes = timestamp 8 + weights 288 + trailing fields 596.
+// Datagram offsets: timestamp 16..23 (skipped), weights 24..311 (consumed).
+// The remaining 596 bytes are videoInputValid 40, laughingProb 4,
+// emotionProb 40 and reserved 512. Tracking does not read any of them.
+// Accepting the prefix alone is a receiver choice, not a claim that senders
+// define those trailing fields as optional in the wire protocol.
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct PxrFTInfo
 {

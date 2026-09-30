@@ -9,6 +9,9 @@ namespace Pico4SAFTExtTrackingModule.PicoConnectors;
 
 public sealed partial class LegacyConnector : IPicoConnector
 {
+    // 16-byte header + skipped 8-byte payload timestamp + 72 float weights = 312.
+    // Parse only this prefix; the complete header + PxrFTInfo layout is 908 bytes.
+    // See Pxr.cs and docs/connector.md. Fragment assembly is not implemented.
     private const int HeaderSize = 16;
     private const int WeightOffset = HeaderSize + sizeof(long);
     private const int WeightBytes = Pxr.BLEND_SHAPE_NUMS * sizeof(float);
@@ -53,6 +56,8 @@ public sealed partial class LegacyConnector : IPicoConnector
             Session? session = null;
             try
             {
+                // 0.0.0.0:29765 also accepts datagrams from unrelated senders.
+                // Length/type checks do not authenticate the sender.
                 socket.Bind(new IPEndPoint(IPAddress.Any, _port));
                 session = new Session(socket);
                 InitializeDiagnostics(session);
@@ -74,6 +79,8 @@ public sealed partial class LegacyConnector : IPicoConnector
 
     // One Update consumer owns this snapshot until its next call. The receiver only
     // writes Session.Latest, so mapping cannot observe a partially overwritten frame.
+    // Mapping, diagnostics and process probes run outside Session.Gate. Pending
+    // samples may be replaced during module pause/backoff; no history is queued.
     public ReadOnlySpan<float> GetBlendShapes()
     {
         Session? session = Volatile.Read(ref _session);
